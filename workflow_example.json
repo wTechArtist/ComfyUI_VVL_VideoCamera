@@ -1,0 +1,82 @@
+{
+  "1": {
+    "inputs": {
+      "video_path": "/path/to/your/video.mp4",
+      "frame_interval": 10,
+      "max_frames": 50,
+      "estimation_method": "hybrid",
+      "enable_visualization": true,
+      "output_format": "detailed_json"
+    },
+    "class_type": "VideoCameraEstimator",
+    "_meta": {
+      "title": "VVL Video Camera Estimator"
+    }
+  },
+  "2": {
+    "inputs": {
+      "text": ["1", 0]
+    },
+    "class_type": "ShowText",
+    "_meta": {
+      "title": "Camera Intrinsics JSON"
+    }
+  },
+  "3": {
+    "inputs": {
+      "images": ["1", 1]
+    },
+    "class_type": "PreviewImage",
+    "_meta": {
+      "title": "Camera Trajectory Visualization"
+    }
+  },
+  "4": {
+    "inputs": {
+      "text": ["1", 2]
+    },
+    "class_type": "ShowText",
+    "_meta": {
+      "title": "Camera Poses JSON"
+    }
+  },
+  "5": {
+    "inputs": {
+      "text": ["1", 3]
+    },
+    "class_type": "ShowText",
+    "_meta": {
+      "title": "Statistics JSON"
+    }
+  },
+  "6": {
+    "inputs": {
+      "text": ["1", 0],
+      "filename_prefix": "camera_intrinsics"
+    },
+    "class_type": "SaveText",
+    "_meta": {
+      "title": "Save Intrinsics"
+    }
+  },
+  "7": {
+    "inputs": {
+      "text": ["1", 2],
+      "filename_prefix": "camera_poses"
+    },
+    "class_type": "SaveText",
+    "_meta": {
+      "title": "Save Poses"
+    }
+  },
+  "8": {
+    "inputs": {
+      "images": ["1", 1],
+      "filename_prefix": "trajectory_visualization"
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "Save Visualization"
+    }
+  }
+} 
