@@ -1132,161 +1132,221 @@ class VideoCameraEstimator:
         }
 
     def _create_colmap_visualization(self, poses: List[Dict]) -> np.ndarray:
-        """创建COLMAP轨迹可视化"""
+        """创建COLMAP轨迹可视化（与其他算法保持一致的3D立体效果）"""
         print(f"创建轨迹可视化，位姿数量: {len(poses)}")
         
         if len(poses) == 0:
-            return self._create_empty_visualization_with_message("没有位姿数据").squeeze(0).numpy()
+            return self._create_empty_visualization_array()
         
         # 提取位置信息
         positions = np.array([pose["position"] for pose in poses])
         print(f"位置数据形状: {positions.shape}")
         print(f"位置范围: X=[{positions[:, 0].min():.3f}, {positions[:, 0].max():.3f}], Y=[{positions[:, 1].min():.3f}, {positions[:, 1].max():.3f}], Z=[{positions[:, 2].min():.3f}, {positions[:, 2].max():.3f}]")
         
-        # 创建3D轨迹的多视图可视化
-        img_size = (1200, 800)
-        img = np.ones((img_size[1], img_size[0], 3), dtype=np.uint8) * 255
-        
-        # 计算位置的边界
-        pos_min = positions.min(axis=0)
-        pos_max = positions.max(axis=0)
-        pos_range = pos_max - pos_min
-        pos_center = (pos_min + pos_max) / 2
-        
-        print(f"位置统计: min={pos_min}, max={pos_max}, range={pos_range}, center={pos_center}")
-        
-        # 绘制三个视图：XY (俯视图), XZ (侧视图), YZ (正视图)
-        views = [
-            {"name": "Top View (XY)", "indices": [0, 1], "pos": (50, 50), "size": (350, 250)},
-            {"name": "Side View (XZ)", "indices": [0, 2], "pos": (450, 50), "size": (350, 250)},
-            {"name": "Front View (YZ)", "indices": [1, 2], "pos": (850, 50), "size": (300, 250)}
-        ]
-        
-        colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]  # 红绿蓝
-        
-        for view_idx, view in enumerate(views):
-            # 获取视图区域
-            x_start, y_start = view["pos"]
-            view_width, view_height = view["size"]
-            
-            # 绘制视图边框
-            cv2.rectangle(img, (x_start-5, y_start-5), 
-                         (x_start+view_width+5, y_start+view_height+5), (100, 100, 100), 2)
-            
-            # 添加视图标题
-            cv2.putText(img, view["name"], (x_start, y_start-10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-            
-            # 提取该视图的2D坐标
-            coord_indices = view["indices"]
-            pos_2d = positions[:, coord_indices]
-            
-            if pos_range[coord_indices].max() > 1e-6:
-                # 归一化到视图范围
-                margin = 20
-                if pos_range[coord_indices].max() > 0:
-                    pos_norm = (pos_2d - pos_min[coord_indices]) / pos_range[coord_indices].max()
-                else:
-                    pos_norm = np.zeros_like(pos_2d)
-                
-                pos_img = pos_norm * (min(view_width, view_height) - 2 * margin) + margin
-                pos_img[:, 0] += x_start
-                pos_img[:, 1] += y_start
-                pos_img = pos_img.astype(int)
-                
-                # 绘制轨迹线
-                for i in range(1, len(pos_img)):
-                    cv2.line(img, tuple(pos_img[i-1]), tuple(pos_img[i]), colors[view_idx], 2)
-                
-                # 绘制位姿点
-                for i, pos in enumerate(pos_img):
-                    # 起点绿色，终点红色，中间点蓝色
-                    if i == 0:
-                        color = (0, 255, 0)  # 绿色起点
-                        radius = 8
-                    elif i == len(pos_img) - 1:
-                        color = (0, 0, 255)  # 红色终点
-                        radius = 8
-                    else:
-                        color = (255, 100, 0)  # 橙色中间点
-                        radius = 4
-                    
-                    cv2.circle(img, tuple(pos), radius, color, -1)
-                    
-                    # 每5个点标记一个编号
-                    if i % 5 == 0 or i == len(pos_img) - 1:
-                        cv2.putText(img, str(i), (pos[0]+10, pos[1]), 
-                                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
-            else:
-                # 位置变化很小，显示中心点
-                center_x = x_start + view_width // 2
-                center_y = y_start + view_height // 2
-                cv2.circle(img, (center_x, center_y), 10, colors[view_idx], -1)
-                cv2.putText(img, "Static", (center_x-20, center_y+25), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, colors[view_idx], 2)
-        
-        # 添加3D信息面板
-        info_y_start = 350
-        cv2.putText(img, "COLMAP 3D Camera Trajectory", (50, info_y_start), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 2)
-        
-        info_lines = [
-            f"Total Poses: {len(poses)}",
-            f"Position Range:",
-            f"  X: [{pos_min[0]:.3f}, {pos_max[0]:.3f}] (range: {pos_range[0]:.3f})",
-            f"  Y: [{pos_min[1]:.3f}, {pos_max[1]:.3f}] (range: {pos_range[1]:.3f})",
-            f"  Z: [{pos_min[2]:.3f}, {pos_max[2]:.3f}] (range: {pos_range[2]:.3f})",
-            f"Center: [{pos_center[0]:.3f}, {pos_center[1]:.3f}, {pos_center[2]:.3f}]"
-        ]
-        
-        # 添加注册状态信息
-        registered_count = sum(1 for pose in poses if pose.get("is_registered", True))
-        info_lines.append(f"Registered: {registered_count}/{len(poses)}")
-        
-        for i, line in enumerate(info_lines):
-            cv2.putText(img, line, (50, info_y_start + 40 + i * 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 1)
-        
-        # 添加图例
-        legend_x = 50
-        legend_y = info_y_start + 40 + len(info_lines) * 30 + 20
-        cv2.putText(img, "Legend:", (legend_x, legend_y), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-        
-        legend_items = [
-            ("Start", (0, 255, 0)),
-            ("End", (0, 0, 255)), 
-            ("Path", (255, 100, 0))
-        ]
-        
-        for i, (label, color) in enumerate(legend_items):
-            y_pos = legend_y + 25 + i * 25
-            cv2.circle(img, (legend_x + 10, y_pos), 6, color, -1)
-            cv2.putText(img, label, (legend_x + 25, y_pos + 5), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
-        
-        return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-    def _create_empty_visualization_with_message(self, message: str) -> torch.Tensor:
-        """创建带消息的空可视化图像"""
-        # 创建一个简单的占位图像
-        img = np.ones((400, 600, 3), dtype=np.float32) * 0.1  # 深灰色背景
-        
-        # 添加消息
         try:
-            img_uint8 = (img * 255).astype(np.uint8)
+            # 使用matplotlib创建3D立体可视化（与其他算法一致）
+            import matplotlib.pyplot as plt
+            from mpl_toolkits.mplot3d import Axes3D
             
-            # 分行显示消息
-            lines = message.split('\n') if '\n' in message else [message]
-            y_start = 180
-            for i, line in enumerate(lines):
-                y_pos = y_start + i * 30
-                cv2.putText(img_uint8, line, (50, y_pos), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+            fig = plt.figure(figsize=(12, 9))
+            ax = fig.add_subplot(111, projection='3d')
             
-            img = img_uint8.astype(np.float32) / 255.0
+            # 绘制轨迹线
+            if len(positions) > 1:
+                ax.plot(positions[:, 0], positions[:, 1], positions[:, 2], 
+                       'b-', linewidth=3, alpha=0.8, label='Camera Path')
+            
+            # 用颜色渐变表示时间进程
+            colors = plt.cm.viridis(np.linspace(0, 1, len(positions)))
+            scatter = ax.scatter(positions[:, 0], positions[:, 1], positions[:, 2], 
+                               c=colors, s=60, alpha=0.9, edgecolors='black', linewidth=0.5)
+            
+            # 标记起点和终点
+            if len(positions) > 0:
+                ax.scatter([positions[0, 0]], [positions[0, 1]], [positions[0, 2]], 
+                          c='green', s=150, marker='^', label='Start', edgecolors='darkgreen', linewidth=2)
+            if len(positions) > 1:
+                ax.scatter([positions[-1, 0]], [positions[-1, 1]], [positions[-1, 2]], 
+                          c='red', s=150, marker='o', label='End', edgecolors='darkred', linewidth=2)
+            
+            # 添加相机方向指示器（每5个位姿显示一个）
+            for i in range(0, len(poses), max(1, len(poses)//10)):
+                pose = poses[i]
+                pos = pose["position"]
+                
+                # 从旋转四元数计算方向向量
+                if "rotation_quaternion" in pose:
+                    quat = pose["rotation_quaternion"]
+                    # 简化的方向向量（相机朝向Z轴负方向）
+                    direction_length = max(0.5, np.linalg.norm(positions.max(axis=0) - positions.min(axis=0)) * 0.1)
+                    
+                    # 计算旋转后的方向向量
+                    qw, qx, qy, qz = quat
+                    # 将Z轴负方向向量旋转
+                    dir_x = 2 * (qx*qz + qw*qy) * direction_length
+                    dir_y = 2 * (qy*qz - qw*qx) * direction_length  
+                    dir_z = -(1 - 2*(qx*qx + qy*qy)) * direction_length
+                    
+                    ax.quiver(pos[0], pos[1], pos[2], dir_x, dir_y, dir_z, 
+                             color='orange', alpha=0.6, arrow_length_ratio=0.1)
+            
+            # 设置坐标轴
+            ax.set_xlabel('X (meters)', fontsize=12)
+            ax.set_ylabel('Y (meters)', fontsize=12)
+            ax.set_zlabel('Z (meters)', fontsize=12)
+            ax.set_title('COLMAP Camera Trajectory (3D View)', fontsize=14, fontweight='bold')
+            
+            # 添加图例
+            ax.legend(loc='upper right', fontsize=10)
+            
+            # 添加颜色条
+            cbar = plt.colorbar(scatter, ax=ax, shrink=0.6, aspect=20)
+            cbar.set_label('Time Progress', fontsize=10)
+            
+            # 设置相等的坐标轴比例
+            max_range = np.array([positions.max(axis=0) - positions.min(axis=0)]).max() / 2.0
+            mid_x = (positions.max(axis=0)[0] + positions.min(axis=0)[0]) * 0.5
+            mid_y = (positions.max(axis=0)[1] + positions.min(axis=0)[1]) * 0.5
+            mid_z = (positions.max(axis=0)[2] + positions.min(axis=0)[2]) * 0.5
+            
+            ax.set_xlim(mid_x - max_range, mid_x + max_range)
+            ax.set_ylim(mid_y - max_range, mid_y + max_range)
+            ax.set_zlim(mid_z - max_range, mid_z + max_range)
+            
+            # 设置网格
+            ax.grid(True, alpha=0.3)
+            
+            # 调整视角
+            ax.view_init(elev=20, azim=45)
+            
+            # 保存为图像
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                plt.savefig(tmp.name, dpi=120, bbox_inches='tight', facecolor='white')
+                plt.close()
+                
+                # 读取图像
+                img = cv2.imread(tmp.name)
+                os.unlink(tmp.name)
+                
+                if img is not None:
+                    # BGR转RGB
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    print(f"成功创建3D轨迹可视化，图像尺寸: {img.shape}")
+                    return img
+                else:
+                    print("读取生成的可视化图像失败")
+                    return self._create_empty_visualization_array()
+        
+        except Exception as e:
+            print(f"创建3D可视化失败: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # 如果3D可视化失败，创建备用的2D可视化
+            return self._create_fallback_2d_visualization(positions)
+
+    def _create_fallback_2d_visualization(self, positions: np.ndarray) -> np.ndarray:
+        """创建备用2D可视化（当3D可视化失败时使用）"""
+        try:
+            import matplotlib.pyplot as plt
+            
+            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 10))
+            fig.suptitle('COLMAP Camera Trajectory (2D Views)', fontsize=16, fontweight='bold')
+            
+            # XY视图（俯视图）
+            if len(positions) > 1:
+                ax1.plot(positions[:, 0], positions[:, 1], 'b-', linewidth=2, alpha=0.7)
+            colors = plt.cm.viridis(np.linspace(0, 1, len(positions)))
+            ax1.scatter(positions[:, 0], positions[:, 1], c=colors, s=50, alpha=0.8, edgecolors='black')
+            if len(positions) > 0:
+                ax1.scatter(positions[0, 0], positions[0, 1], c='green', s=100, marker='^', label='Start')
+            if len(positions) > 1:
+                ax1.scatter(positions[-1, 0], positions[-1, 1], c='red', s=100, marker='o', label='End')
+            ax1.set_xlabel('X (meters)')
+            ax1.set_ylabel('Y (meters)')
+            ax1.set_title('Top View (XY)')
+            ax1.legend()
+            ax1.grid(True, alpha=0.3)
+            
+            # XZ视图（侧视图）
+            if len(positions) > 1:
+                ax2.plot(positions[:, 0], positions[:, 2], 'g-', linewidth=2, alpha=0.7)
+            ax2.scatter(positions[:, 0], positions[:, 2], c=colors, s=50, alpha=0.8, edgecolors='black')
+            if len(positions) > 0:
+                ax2.scatter(positions[0, 0], positions[0, 2], c='green', s=100, marker='^')
+            if len(positions) > 1:
+                ax2.scatter(positions[-1, 0], positions[-1, 2], c='red', s=100, marker='o')
+            ax2.set_xlabel('X (meters)')
+            ax2.set_ylabel('Z (meters)')
+            ax2.set_title('Side View (XZ)')
+            ax2.grid(True, alpha=0.3)
+            
+            # YZ视图（正视图）
+            if len(positions) > 1:
+                ax3.plot(positions[:, 1], positions[:, 2], 'r-', linewidth=2, alpha=0.7)
+            ax3.scatter(positions[:, 1], positions[:, 2], c=colors, s=50, alpha=0.8, edgecolors='black')
+            if len(positions) > 0:
+                ax3.scatter(positions[0, 1], positions[0, 2], c='green', s=100, marker='^')
+            if len(positions) > 1:
+                ax3.scatter(positions[-1, 1], positions[-1, 2], c='red', s=100, marker='o')
+            ax3.set_xlabel('Y (meters)')
+            ax3.set_ylabel('Z (meters)')
+            ax3.set_title('Front View (YZ)')
+            ax3.grid(True, alpha=0.3)
+            
+            # 统计信息面板
+            ax4.axis('off')
+            stats_text = f"""COLMAP Trajectory Statistics
+            
+Total Poses: {len(positions)}
+Position Range:
+  X: [{positions[:, 0].min():.3f}, {positions[:, 0].max():.3f}]
+  Y: [{positions[:, 1].min():.3f}, {positions[:, 1].max():.3f}]
+  Z: [{positions[:, 2].min():.3f}, {positions[:, 2].max():.3f}]
+
+Path Length: {np.sum(np.linalg.norm(np.diff(positions, axis=0), axis=1)):.3f}m"""
+            
+            ax4.text(0.1, 0.9, stats_text, transform=ax4.transAxes, fontsize=11,
+                    verticalalignment='top', fontfamily='monospace',
+                    bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
+            
+            plt.tight_layout()
+            
+            # 保存为图像
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
+                plt.savefig(tmp.name, dpi=120, bbox_inches='tight', facecolor='white')
+                plt.close()
+                
+                # 读取图像
+                img = cv2.imread(tmp.name)
+                os.unlink(tmp.name)
+                
+                if img is not None:
+                    # BGR转RGB
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    return img
+                else:
+                    return self._create_empty_visualization_array()
+        
+        except Exception as e:
+            print(f"创建备用2D可视化也失败: {e}")
+            return self._create_empty_visualization_array()
+
+    def _create_empty_visualization_array(self) -> np.ndarray:
+        """创建空的可视化图像数组"""
+        # 创建一个简单的占位图像
+        img = np.ones((400, 600, 3), dtype=np.uint8) * 50  # 深灰色背景
+        
+        # 添加文字提示
+        try:
+            cv2.putText(img, "COLMAP Visualization", (150, 180), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+            cv2.putText(img, "No Trajectory Data", (170, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
         except:
             pass  # 如果添加文字失败，返回纯色图像
         
-        return torch.from_numpy(img).unsqueeze(0)
+        return img
 
     def _format_point_cloud_output(self, point_cloud_info: Dict, output_format: str) -> str:
         """格式化点云信息输出"""
@@ -1374,20 +1434,37 @@ class VideoCameraEstimator:
             if isinstance(trajectory_data, list):
                 # 从列表转换为numpy数组
                 img_array = np.array(trajectory_data, dtype=np.uint8)
+            elif isinstance(trajectory_data, np.ndarray):
+                # 直接使用numpy数组（来自新的COLMAP可视化）
+                img_array = trajectory_data
             else:
                 img_array = trajectory_data
             
+            # 确保图像是正确的格式
             if len(img_array.shape) == 3 and img_array.shape[2] == 3:
-                # BGR转RGB
-                img_array = cv2.cvtColor(img_array, cv2.COLOR_BGR2RGB)
+                # 确保数据类型是uint8
+                if img_array.dtype != np.uint8:
+                    if img_array.max() <= 1.0:
+                        # 如果是0-1范围，转换为0-255
+                        img_array = (img_array * 255).astype(np.uint8)
+                    else:
+                        img_array = img_array.astype(np.uint8)
+                
+                # 如果图像已经是RGB格式（来自matplotlib），不需要BGR转RGB
+                # 只有从OpenCV读取的图像才需要BGR转RGB转换
+                # 由于我们的新可视化直接返回RGB格式，这里不需要转换
+                
                 # 转换为torch tensor (H, W, C) -> (1, H, W, C)
                 img_tensor = torch.from_numpy(img_array.astype(np.float32) / 255.0)
                 return img_tensor.unsqueeze(0)
             else:
+                print(f"图像格式不正确: shape={img_array.shape}")
                 return self._create_empty_visualization()
                 
         except Exception as e:
             print(f"可视化图像处理错误: {e}")
+            import traceback
+            traceback.print_exc()
             return self._create_empty_visualization()
 
     def _create_empty_visualization(self) -> torch.Tensor:
