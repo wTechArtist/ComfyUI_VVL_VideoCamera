@@ -1,1 +1,0 @@
-# Utils package for video camera parameter estimation 

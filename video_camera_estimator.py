@@ -4,10 +4,10 @@ import json
 import os
 import tempfile
 import cv2
-import subprocess
 import shutil
 from PIL import Image
 from typing import List, Dict, Any
+import pathlib
 
 # 添加ComfyUI类型导入
 try:
@@ -15,454 +15,105 @@ try:
 except ImportError:
     # 如果无法导入，创建一个兼容的类
     class IO:
-        VIDEO = "VIDEO"
+        IMAGE = "IMAGE"
 
-# 修复导入路径
-try:
-    from .utils.camera_utils import CameraParameterEstimator
-except ImportError:
-    try:
-        # 尝试相对导入
-        import sys
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        utils_path = os.path.join(current_dir, 'utils')
-        if utils_path not in sys.path:
-            sys.path.insert(0, utils_path)
-        from camera_utils import CameraParameterEstimator
-    except ImportError:
-        # 最后的备用方案
-        import sys
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        sys.path.insert(0, current_dir)
-        try:
-            from utils.camera_utils import CameraParameterEstimator
-        except ImportError as e:
-            print(f"无法导入 CameraParameterEstimator: {e}")
-            # 创建一个虚拟类，避免启动失败
-            class CameraParameterEstimator:
-                def __init__(self):
-                    self.error = "CameraParameterEstimator 导入失败"
-                
-                def estimate_from_video(self, *args, **kwargs):
-                    return {
-                        "success": False,
-                        "error": self.error,
-                        "intrinsics": None,
-                        "poses": [],
-                        "statistics": None,
-                        "frame_count": 0,
-                        "trajectory_visualization": None
-                    }
-
-# 全局估计器实例
-_ESTIMATOR = None
-
-class VideoCameraEstimator:
-    """视频相机参数估计节点"""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "video": (IO.VIDEO, {
-                    "tooltip": "从LoadVideo节点输入的视频，或者直接输入视频文件路径"
-                }),
-            },
-            "optional": {
-                "video_path": ("STRING", {
-                    "default": "",
-                    "tooltip": "视频文件路径（可选，如果video输入为空则使用此路径）"
-                }),
-                "frame_interval": ("INT", {
-                    "default": 10,
-                    "min": 1,
-                    "max": 100,
-                    "step": 1,
-                    "tooltip": "提取帧的间隔，数值越小提取的帧越多"
-                }),
-                "max_frames": ("INT", {
-                    "default": 50,
-                    "min": 5,
-                    "max": 200,
-                    "step": 5,
-                    "tooltip": "最大提取帧数，用于控制计算量"
-                }),
-                "estimation_method": (["colmap","opencv_sfm", "feature_matching", "hybrid" ], {
-                    "default": "colmap",
-                    "tooltip": "相机参数估计方法，colmap提供最高精度"
-                }),
-                "enable_visualization": ("BOOLEAN", {
-                    "default": True,
-                    "tooltip": "是否生成轨迹可视化图像"
-                }),
-                "output_format": (["json", "detailed_json"], {
-                    "default": "detailed_json",
-                    "tooltip": "输出格式，详细模式包含更多统计信息"
-                }),
-                # COLMAP 特定参数
-                "colmap_feature_type": (["sift", "superpoint", "disk"], {
-                    "default": "sift",
-                    "tooltip": "COLMAP特征检测器类型，SIFT最稳定，SuperPoint和DISK更现代"
-                }),
-                "colmap_matcher_type": (["exhaustive", "sequential", "spatial"], {
-                    "default": "sequential",
-                    "tooltip": "COLMAP匹配策略，sequential适合视频序列"
-                }),
-                "colmap_quality": (["low", "medium", "high", "extreme"], {
-                    "default": "medium",
-                    "tooltip": "COLMAP重建质量，higher质量需要更多时间"
-                }),
-                "enable_dense_reconstruction": ("BOOLEAN", {
-                    "default": False,
-                    "tooltip": "是否启用密集重建（仅限COLMAP，需要更多计算资源）"
-                })
-            }
-        }
-
-    RETURN_TYPES = ("STRING", "IMAGE", "STRING", "STRING", "STRING")
-    RETURN_NAMES = ("intrinsics_json", "trajectory_visualization", "poses_json", "statistics_json", "point_cloud_info")
-    FUNCTION = "estimate_camera_parameters"
-    CATEGORY = "💃VVL/VideoCamera"
+class ColmapCameraEstimator:
+    """使用COLMAP进行相机参数估计的核心类"""
 
     def __init__(self):
-        global _ESTIMATOR
-        if _ESTIMATOR is None:
-            _ESTIMATOR = CameraParameterEstimator()
-        self.estimator = _ESTIMATOR
-        # 检查COLMAP是否可用
-        self.colmap_available = self._check_colmap_availability()
+        self.check_dependencies()
 
-    def estimate_camera_parameters(self, video, video_path: str = "", frame_interval: int = 10, max_frames: int = 50,
-                                 estimation_method: str = "hybrid", enable_visualization: bool = True,
-                                 output_format: str = "detailed_json", colmap_feature_type: str = "sift",
-                                 colmap_matcher_type: str = "sequential", colmap_quality: str = "medium",
-                                 enable_dense_reconstruction: bool = False) -> tuple:
-        """
-        从视频估计相机参数的主函数
-        
-        Args:
-            video: 来自LoadVideo节点的视频对象或None
-            video_path: 视频文件路径（备用）
-            frame_interval: 帧提取间隔
-            max_frames: 最大帧数
-            estimation_method: 估计方法
-            enable_visualization: 是否生成可视化
-            output_format: 输出格式
-            colmap_feature_type: COLMAP特征类型
-            colmap_matcher_type: COLMAP匹配策略
-            colmap_quality: COLMAP重建质量
-            enable_dense_reconstruction: 是否启用密集重建
-            
-        Returns:
-            tuple: (内参JSON, 轨迹可视化图像, 位姿JSON, 统计信息JSON, 点云信息JSON)
-        """
-        
-        try:
-            # 确定视频文件路径
-            actual_video_path = None
-            
-            # 优先使用video输入（来自LoadVideo节点）
-            if video is not None:
-                # 如果video是VideoFromFile对象，获取其文件路径
-                if hasattr(video, '_VideoFromFile__file'):
-                    # 访问私有属性 __file
-                    file_attr = video._VideoFromFile__file
-                    if isinstance(file_attr, str):
-                        actual_video_path = file_attr
-                    else:
-                        print(f"video.__file 不是字符串类型: {type(file_attr)}")
-                elif hasattr(video, 'path'):
-                    actual_video_path = video.path
-                elif hasattr(video, 'video_path'):
-                    actual_video_path = video.video_path
-                elif hasattr(video, '_path'):
-                    actual_video_path = video._path
-                elif hasattr(video, 'file_path'):
-                    actual_video_path = video.file_path
-                else:
-                    # 尝试直接使用video作为路径
-                    if isinstance(video, str):
-                        actual_video_path = video
-                    else:
-                        print(f"无法从video对象获取路径，video类型: {type(video)}")
-                        print(f"video对象属性: {[attr for attr in dir(video) if not attr.startswith('_')]}")
-                        if hasattr(video, '__dict__'):
-                            print(f"video对象内容: {video.__dict__}")
-                        
-                        # 尝试调用get_components来看是否能获取信息
-                        try:
-                            if hasattr(video, 'get_components'):
-                                components = video.get_components()
-                                print(f"video components: {components}")
-                        except Exception as e:
-                            print(f"调用get_components失败: {e}")
-            
-            # 如果video输入无效，使用video_path
-            if actual_video_path is None or not actual_video_path:
-                if video_path and video_path.strip():
-                    actual_video_path = video_path.strip()
-                else:
-                    raise ValueError("未提供有效的视频输入。请连接LoadVideo节点到video输入，或在video_path中输入文件路径。")
-            
-            # 验证视频文件
-            if not os.path.exists(actual_video_path):
-                raise FileNotFoundError(f"视频文件不存在: {actual_video_path}")
-            
-            # 验证视频格式
-            if not self._is_valid_video_format(actual_video_path):
-                raise ValueError("不支持的视频格式")
-            
-            print(f"开始处理视频: {actual_video_path}")
-            print(f"参数 - 帧间隔: {frame_interval}, 最大帧数: {max_frames}, 方法: {estimation_method}")
-            
-            # 根据估计方法选择处理流程
-            if estimation_method == "colmap":
-                if not self.colmap_available:
-                    raise RuntimeError("COLMAP 未安装或不可用，请安装 COLMAP 或选择其他估计方法")
-                
-                result = self._estimate_with_colmap(
-                    video_path=actual_video_path,
-                    frame_interval=frame_interval,
-                    max_frames=max_frames,
-                    feature_type=colmap_feature_type,
-                    matcher_type=colmap_matcher_type,
-                    quality=colmap_quality,
-                    enable_dense=enable_dense_reconstruction
-                )
-            else:
-                # 使用原有的估计器
-                result = self.estimator.estimate_from_video(
-                    video_path=actual_video_path,
-                    frame_interval=frame_interval,
-                    max_frames=max_frames
-                )
-            
-            if not result["success"]:
-                raise RuntimeError(f"相机参数估计失败: {result.get('error', '未知错误')}")
-            
-            # 准备输出
-            intrinsics_json = self._format_intrinsics_output(result["intrinsics"], output_format)
-            poses_json = self._format_poses_output(result["poses"], output_format)
-            statistics_json = self._format_statistics_output(result["statistics"], result, output_format)
-            
-            # 处理点云信息（COLMAP特有）
-            point_cloud_info = self._format_point_cloud_output(result.get("point_cloud", {}), output_format)
-            
-            # 处理可视化图像
-            if enable_visualization and result.get("trajectory_visualization") is not None:
-                trajectory_img = self._prepare_visualization_image(result["trajectory_visualization"])
-            else:
-                trajectory_img = self._create_empty_visualization()
-            
-            print(f"成功处理 {result['frame_count']} 帧")
-            if result['intrinsics']:
-                print(f"估计的焦距: {result['intrinsics']['focal_length']:.2f}")
-            
-            return (intrinsics_json, trajectory_img, poses_json, statistics_json, point_cloud_info)
-            
-        except Exception as e:
-            error_msg = f"视频相机参数估计出错: {str(e)}"
-            print(error_msg)
-            
-            # 返回错误信息
-            error_json = json.dumps({"error": error_msg, "success": False}, ensure_ascii=False, indent=2)
-            empty_img = self._create_empty_visualization()
-            
-            return (error_json, empty_img, error_json, error_json, error_json)
-
-    def _check_colmap_availability(self) -> bool:
-        """检查COLMAP是否可用"""
-        try:
-            # 优先检查PyColmap
-            import pycolmap
-            print("检测到 PyColmap，将使用 Python API 进行 COLMAP 重建")
-            return True
-        except ImportError:
-            try:
-                # 尝试命令行版本
-                result = subprocess.run(['colmap', '--help'], 
-                                      capture_output=True, text=True, timeout=10)
-                if result.returncode == 0:
-                    print("检测到命令行 COLMAP")
-                    return True
-            except (subprocess.TimeoutExpired, FileNotFoundError, subprocess.SubprocessError):
-                pass
-        print("COLMAP 不可用：需要安装 pycolmap 或命令行版本的 COLMAP")
-        return False
-
-    def _estimate_with_colmap(self, video_path: str, frame_interval: int, max_frames: int,
-                            feature_type: str, matcher_type: str, quality: str, enable_dense: bool) -> Dict:
-        """使用COLMAP进行相机参数估计"""
-        
-        # 优先使用PyColmap
+    def check_dependencies(self):
+        """检查PyColmap依赖"""
         try:
             import pycolmap
-            return self._estimate_with_pycolmap(
-                video_path, frame_interval, max_frames, 
-                feature_type, matcher_type, quality, enable_dense
-            )
-        except ImportError:
-            # 回退到命令行版本
-            return self._estimate_with_colmap_cli(
-                video_path, frame_interval, max_frames, 
-                feature_type, matcher_type, quality, enable_dense
-            )
+            self.pycolmap = pycolmap
+            print("PyColmap 已成功导入")
+        except ImportError as e:
+            print(f"PyColmap 导入失败: {e}")
+            print("请安装 PyColmap: pip install pycolmap")
+            raise ImportError("PyColmap 是必需的依赖")
 
-    def _estimate_with_pycolmap(self, video_path: str, frame_interval: int, max_frames: int,
-                              feature_type: str, matcher_type: str, quality: str, enable_dense: bool) -> Dict:
-        """使用PyColmap进行相机参数估计"""
-        import pycolmap
+    def estimate_from_images(self, images: List[torch.Tensor], 
+                           colmap_feature_type: str = "sift",
+                           colmap_matcher_type: str = "sequential", 
+                           colmap_quality: str = "medium",
+                           enable_dense_reconstruction: bool = False) -> Dict:
+        """从图片序列估计相机参数"""
         
+        if len(images) < 3:
+            return {
+                "success": False,
+                "error": "图片数量不足，至少需要3张图片进行重建",
+                "intrinsics": None,
+                "poses": [],
+                "statistics": {},
+                "frame_count": 0,
+                "point_cloud": {}
+            }
+
         # 创建临时工作目录
-        temp_dir = tempfile.mkdtemp(prefix="pycolmap_estimation_")
+        temp_dir = tempfile.mkdtemp(prefix="colmap_images_")
         images_dir = os.path.join(temp_dir, "images")
         database_path = os.path.join(temp_dir, "database.db")
+        output_path = os.path.join(temp_dir, "reconstruction")
         
         try:
             os.makedirs(images_dir, exist_ok=True)
-            
-            # 1. 提取视频帧
-            print("提取视频帧...")
-            frame_paths = self._extract_frames_for_colmap(video_path, images_dir, frame_interval, max_frames)
-            
-            if len(frame_paths) < 3:
-                raise ValueError("提取的帧数过少（< 3），无法进行重建")
-            
-            print(f"成功提取 {len(frame_paths)} 帧")
+            os.makedirs(output_path, exist_ok=True)
+
+            # 1. 保存图片到临时目录
+            print(f"保存 {len(images)} 张图片到临时目录...")
+            image_paths = self._save_images_to_temp(images, images_dir)
             
             # 2. 设置质量参数
-            quality_settings = {
-                "low": {"max_image_size": 800, "max_num_features": 4096},
-                "medium": {"max_image_size": 1200, "max_num_features": 8192},
-                "high": {"max_image_size": 1600, "max_num_features": 16384},
-                "extreme": {"max_image_size": 2400, "max_num_features": 32768}
-            }
-            settings = quality_settings[quality]
+            quality_settings = self._get_quality_settings(colmap_quality)
             
-            # 3. 使用PyColmap的简化API
-            print("开始 PyColmap 重建...")
+            # 3. 特征提取
+            print("开始特征提取...")
+            self._extract_features(database_path, images_dir, quality_settings)
             
-            # 创建数据库
-            database = pycolmap.Database()
-            database.create(database_path)
+            # 4. 特征匹配
+            print(f"开始特征匹配 ({colmap_matcher_type})...")
+            self._match_features(database_path, colmap_matcher_type)
             
-            # 特征提取选项
-            sift_options = pycolmap.SiftExtractionOptions()
-            sift_options.max_image_size = settings["max_image_size"]
-            sift_options.max_num_features = settings["max_num_features"]
+            # 5. 增量重建
+            print("开始增量重建...")
+            reconstructions = self._incremental_mapping(database_path, images_dir, output_path)
             
-            # 特征提取
-            print("特征提取...")
-            pycolmap.extract_features(
-                database_path=database_path,
-                image_path=images_dir,
-                sift_options=sift_options
-            )
+            if not reconstructions:
+                return {
+                    "success": False,
+                    "error": "COLMAP 重建失败：没有生成重建结果",
+                    "intrinsics": None,
+                    "poses": [],
+                    "statistics": {},
+                    "frame_count": 0,
+                    "point_cloud": {}
+                }
             
-            # 特征匹配
-            print("特征匹配...")
-            if matcher_type == "exhaustive":
-                match_options = pycolmap.ExhaustiveMatchingOptions()
-                pycolmap.match_exhaustive(
-                    database_path=database_path,
-                    match_options=match_options
-                )
-            elif matcher_type == "sequential":
-                match_options = pycolmap.SequentialMatchingOptions()
-                match_options.overlap = 10
-                pycolmap.match_sequential(
-                    database_path=database_path,
-                    match_options=match_options
-                )
-            else:  # spatial
-                match_options = pycolmap.SpatialMatchingOptions()
-                pycolmap.match_spatial(
-                    database_path=database_path,
-                    match_options=match_options
-                )
+            # 6. 解析结果
+            reconstruction = self._get_best_reconstruction(reconstructions)
+            result = self._parse_reconstruction(reconstruction, len(images))
             
-            # 增量重建
-            print("增量重建...")
-            output_path = os.path.join(temp_dir, "reconstruction")
-            os.makedirs(output_path, exist_ok=True)
-            
-            # 使用默认的重建选项
-            mapper_options = pycolmap.IncrementalMapperOptions()
-            
-            # 只设置存在的属性
-            try:
-                mapper_options.ba_refine_focal_length = True
-                mapper_options.ba_refine_principal_point = True
-            except AttributeError:
-                pass  # 如果属性不存在，跳过
-            
-            try:
-                mapper_options.init_min_num_inliers = 100
-            except AttributeError:
-                pass
-            
-            try:
-                mapper_options.init_max_reg_trials = 2
-            except AttributeError:
-                pass
-            
-            # 执行重建
-            reconstruction = pycolmap.incremental_mapping(
-                database_path=database_path,
-                image_path=images_dir,
-                output_path=output_path,
-                options=mapper_options
-            )
-            
-            if not reconstruction:
-                raise RuntimeError("PyColmap 重建失败：没有生成重建结果")
-            
-            # 获取重建结果
-            if isinstance(reconstruction, dict):
-                # 如果返回的是字典，尝试获取第一个重建
-                if len(reconstruction) == 0:
-                    raise RuntimeError("PyColmap 重建失败：重建结果为空")
-                recon = list(reconstruction.values())[0]
-            elif isinstance(reconstruction, list):
-                if len(reconstruction) == 0:
-                    raise RuntimeError("PyColmap 重建失败：重建结果为空")
-                recon = reconstruction[0]
-            else:
-                recon = reconstruction
-            
-            print(f"重建成功：{len(recon.cameras)} 个相机，{len(recon.images)} 张图像，{len(recon.points3D)} 个3D点")
-            
-            # 解析结果
-            result = self._parse_with_pycolmap(recon, frame_paths, {})
-            
-            # 生成可视化
-            if result["success"]:
-                result["trajectory_visualization"] = self._create_colmap_visualization(result["poses"])
+            print(f"重建成功：{len(reconstruction.cameras)} 个相机，{len(reconstruction.images)} 张图像，{len(reconstruction.points3D)} 个3D点")
             
             return result
             
         except Exception as e:
-            print(f"PyColmap 估计过程出错: {e}")
+            print(f"COLMAP 估计过程出错: {e}")
             import traceback
             traceback.print_exc()
             
-            # 尝试使用更简单的方法
-            try:
-                print("尝试使用简化的 PyColmap 方法...")
-                result = self._simple_pycolmap_reconstruction(images_dir, database_path, frame_paths)
-                return result
-            except Exception as e2:
-                print(f"简化方法也失败: {e2}")
-                return {
-                    "success": False,
-                    "error": f"PyColmap 重建失败: {str(e)}",
-                    "intrinsics": None,
-                    "poses": [],
-                    "statistics": {"total_distance": 0, "average_speed": 0},
-                    "frame_count": 0,
-                    "trajectory_visualization": None,
-                    "point_cloud": {}
-                }
+            return {
+                "success": False,
+                "error": f"COLMAP 重建失败: {str(e)}",
+                "intrinsics": None,
+                "poses": [],
+                "statistics": {},
+                "frame_count": 0,
+                "point_cloud": {}
+            }
         finally:
             # 清理临时文件
             try:
@@ -470,623 +121,295 @@ class VideoCameraEstimator:
             except:
                 pass
 
-    def _simple_pycolmap_reconstruction(self, images_dir: str, database_path: str, frame_paths: List[str]) -> Dict:
-        """使用最简单的PyColmap重建方法"""
-        import pycolmap
+    def _save_images_to_temp(self, images: List[torch.Tensor], images_dir: str) -> List[str]:
+        """将图片张量保存到临时目录"""
+        image_paths = []
         
-        try:
-            # 创建输出目录
-            output_dir = os.path.dirname(database_path)
-            reconstruction_dir = os.path.join(output_dir, "simple_recon")
-            os.makedirs(reconstruction_dir, exist_ok=True)
+        for i, image_tensor in enumerate(images):
+            # 转换张量格式
+            if image_tensor.dim() == 4:  # Batch dimension
+                image_tensor = image_tensor.squeeze(0)
             
-            # 使用最基本的特征提取和匹配
-            print("简化特征提取...")
-            pycolmap.extract_features(database_path, images_dir)
+            # 确保是 HWC 格式
+            if image_tensor.dim() == 3 and image_tensor.shape[0] == 3:  # CHW -> HWC
+                image_tensor = image_tensor.permute(1, 2, 0)
             
-            print("简化特征匹配...")
-            pycolmap.match_exhaustive(database_path)
+            # 转换为numpy数组
+            image_np = image_tensor.cpu().numpy()
             
-            print("简化重建...")
-            reconstructions = pycolmap.incremental_mapping(database_path, images_dir, reconstruction_dir)
-            
-            if not reconstructions:
-                raise RuntimeError("简化重建失败")
-            
-            # 获取第一个重建
-            if isinstance(reconstructions, dict) and len(reconstructions) > 0:
-                recon = list(reconstructions.values())[0]
-            elif isinstance(reconstructions, list) and len(reconstructions) > 0:
-                recon = reconstructions[0]
+            # 确保值在0-255范围内
+            if image_np.max() <= 1.0:
+                image_np = (image_np * 255).astype(np.uint8)
             else:
-                recon = reconstructions
+                image_np = image_np.astype(np.uint8)
             
-            print(f"简化重建成功：{len(recon.cameras)} 个相机，{len(recon.images)} 张图像")
+            # 保存图片
+            image_filename = f"image_{i:06d}.jpg"
+            image_path = os.path.join(images_dir, image_filename)
             
-            # 解析结果
-            result = self._parse_with_pycolmap(recon, frame_paths, {})
+            # 转换为BGR格式保存（OpenCV格式）
+            image_bgr = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+            cv2.imwrite(image_path, image_bgr, [cv2.IMWRITE_JPEG_QUALITY, 95])
             
-            # 生成可视化
-            if result["success"]:
-                result["trajectory_visualization"] = self._create_colmap_visualization(result["poses"])
-            
-            return result
-            
-        except Exception as e:
-            print(f"简化重建失败: {e}")
-            return {
-                "success": False,
-                "error": f"简化PyColmap重建失败: {str(e)}",
-                "intrinsics": None,
-                "poses": [],
-                "statistics": {"total_distance": 0, "average_speed": 0},
-                "frame_count": 0,
-                "trajectory_visualization": None,
-                "point_cloud": {}
-            }
+            image_paths.append(image_path)
+        
+        return image_paths
 
-    def _extract_frames_for_colmap(self, video_path: str, output_dir: str, interval: int, max_frames: int) -> List[str]:
-        """为COLMAP提取视频帧"""
-        cap = cv2.VideoCapture(video_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        frame_paths = []
-        frame_count = 0
-        current_frame = 0
-        
-        while current_frame < total_frames and frame_count < max_frames:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
-            ret, frame = cap.read()
-            
-            if ret:
-                # 保存帧
-                frame_filename = f"frame_{frame_count:06d}.jpg"
-                frame_path = os.path.join(output_dir, frame_filename)
-                cv2.imwrite(frame_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                frame_paths.append(frame_path)
-                frame_count += 1
-            
-            current_frame += interval
-        
-        cap.release()
-        return frame_paths
-
-    def _run_colmap_feature_extraction(self, database_path: str, images_dir: str, feature_type: str, quality: str):
-        """运行COLMAP特征提取"""
-        
-        # 设置质量参数
+    def _get_quality_settings(self, quality: str) -> Dict:
+        """获取质量设置"""
         quality_settings = {
             "low": {"max_image_size": 800, "max_num_features": 4096},
             "medium": {"max_image_size": 1200, "max_num_features": 8192},
             "high": {"max_image_size": 1600, "max_num_features": 16384},
             "extreme": {"max_image_size": 2400, "max_num_features": 32768}
         }
-        settings = quality_settings[quality]
-        
-        cmd = [
-            "colmap", "feature_extractor",
-            "--database_path", database_path,
-            "--image_path", images_dir,
-            "--ImageReader.single_camera", "1",
-            "--ImageReader.camera_model", "PINHOLE",
-            "--SiftExtraction.max_image_size", str(settings["max_image_size"]),
-            "--SiftExtraction.max_num_features", str(settings["max_num_features"])
-        ]
-        
-        if feature_type != "sift":
-            # 对于非SIFT特征，可能需要额外配置
-            print(f"注意：{feature_type} 特征可能需要额外配置，当前使用SIFT作为后备")
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode != 0:
-            raise RuntimeError(f"COLMAP特征提取失败: {result.stderr}")
+        return quality_settings.get(quality, quality_settings["medium"])
 
-    def _run_colmap_matching(self, database_path: str, matcher_type: str):
-        """运行COLMAP特征匹配"""
+    def _extract_features(self, database_path: str, images_dir: str, quality_settings: Dict):
+        """提取特征"""
+        sift_options = self.pycolmap.SiftExtractionOptions()
+        sift_options.max_image_size = quality_settings["max_image_size"]
+        sift_options.max_num_features = quality_settings["max_num_features"]
         
+        self.pycolmap.extract_features(
+            database_path=database_path,
+            image_path=images_dir,
+            sift_options=sift_options
+        )
+
+    def _match_features(self, database_path: str, matcher_type: str):
+        """匹配特征"""
         if matcher_type == "exhaustive":
-            cmd = ["colmap", "exhaustive_matcher", "--database_path", database_path]
+            matching_options = self.pycolmap.ExhaustiveMatchingOptions()
+            self.pycolmap.match_exhaustive(
+                database_path=database_path,
+                matching_options=matching_options
+            )
         elif matcher_type == "sequential":
-            cmd = ["colmap", "sequential_matcher", "--database_path", database_path,
-                   "--SequentialMatching.overlap", "10"]
+            matching_options = self.pycolmap.SequentialMatchingOptions()
+            matching_options.overlap = 10
+            self.pycolmap.match_sequential(
+                database_path=database_path,
+                matching_options=matching_options
+            )
         elif matcher_type == "spatial":
-            cmd = ["colmap", "spatial_matcher", "--database_path", database_path]
+            matching_options = self.pycolmap.SpatialMatchingOptions()
+            self.pycolmap.match_spatial(
+                database_path=database_path,
+                matching_options=matching_options
+            )
         else:
             raise ValueError(f"不支持的匹配器类型: {matcher_type}")
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-        if result.returncode != 0:
-            raise RuntimeError(f"COLMAP特征匹配失败: {result.stderr}")
 
-    def _run_colmap_sparse_reconstruction(self, database_path: str, images_dir: str, output_dir: str):
-        """运行COLMAP稀疏重建"""
-        
-        cmd = [
-            "colmap", "mapper",
-            "--database_path", database_path,
-            "--image_path", images_dir,
-            "--output_path", output_dir
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-        if result.returncode != 0:
-            raise RuntimeError(f"COLMAP稀疏重建失败: {result.stderr}")
+    def _incremental_mapping(self, database_path: str, images_dir: str, output_path: str):
+        """增量重建"""
+        # COLMAP >= 0.3.0 使用 IncrementalPipelineOptions 作为配置类型
+        # 早期版本可能仍支持 IncrementalMapperOptions，但为保持兼容性
+        # 这里优先尝试 IncrementalPipelineOptions，并在回退情况下使用默认配置。
 
-    def _run_colmap_dense_reconstruction(self, images_dir: str, sparse_dir: str, dense_dir: str) -> Dict:
-        """运行COLMAP密集重建"""
-        dense_info = {"enabled": True}
-        
         try:
-            # 图像去畸变
-            cmd = ["colmap", "image_undistorter",
-                   "--image_path", images_dir,
-                   "--input_path", sparse_dir,
-                   "--output_path", dense_dir,
-                   "--output_type", "COLMAP"]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            if result.returncode != 0:
-                dense_info["undistort_error"] = result.stderr
-                return dense_info
-            
-            # 立体匹配
-            stereo_dir = os.path.join(dense_dir, "stereo")
-            cmd = ["colmap", "patch_match_stereo",
-                   "--workspace_path", dense_dir,
-                   "--workspace_format", "COLMAP",
-                   "--PatchMatchStereo.geom_consistency", "true"]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
-            if result.returncode != 0:
-                dense_info["stereo_error"] = result.stderr
-                return dense_info
-            
-            # 立体融合
-            cmd = ["colmap", "stereo_fusion",
-                   "--workspace_path", dense_dir,
-                   "--workspace_format", "COLMAP",
-                   "--input_type", "geometric",
-                   "--output_path", os.path.join(dense_dir, "fused.ply")]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
-            if result.returncode != 0:
-                dense_info["fusion_error"] = result.stderr
-            else:
-                dense_info["point_cloud_path"] = os.path.join(dense_dir, "fused.ply")
-                
-        except Exception as e:
-            dense_info["error"] = str(e)
-        
-        return dense_info
+            pipeline_options = self.pycolmap.IncrementalPipelineOptions()
 
-    def _parse_colmap_results(self, reconstruction_dir: str, frame_paths: List[str], dense_info: Dict) -> Dict:
-        """解析COLMAP重建结果"""
+            # 通过内部的 mapper_options 设置常用参数
+            if hasattr(pipeline_options, "mapper_options"):
+                mapper_opts = pipeline_options.mapper_options
+                mapper_opts.ba_refine_focal_length = True
+                mapper_opts.ba_refine_principal_point = True
+                mapper_opts.init_min_num_inliers = 100
+                mapper_opts.init_max_reg_trials = 2
+        except AttributeError:
+            # 如果安装的 pycolmap 版本没有 IncrementalPipelineOptions，则退回默认
+            pipeline_options = None
+
+        if pipeline_options is not None:
+            reconstructions = self.pycolmap.incremental_mapping(
+                database_path=database_path,
+                image_path=images_dir,
+                output_path=output_path,
+                options=pipeline_options
+            )
+        else:
+            # 回退：不显式传入 options，使用库默认值。
+            reconstructions = self.pycolmap.incremental_mapping(
+                database_path=database_path,
+                image_path=images_dir,
+                output_path=output_path
+            )
         
+        return reconstructions
+
+    def _get_best_reconstruction(self, reconstructions):
+        """获取最佳重建结果"""
+        if isinstance(reconstructions, dict):
+            if len(reconstructions) == 0:
+                raise RuntimeError("重建结果为空")
+            # 选择图像数量最多的重建
+            best_recon = max(reconstructions.values(), key=lambda r: len(r.images))
+            return best_recon
+        elif isinstance(reconstructions, list):
+            if len(reconstructions) == 0:
+                raise RuntimeError("重建结果为空")
+            # 选择图像数量最多的重建
+            best_recon = max(reconstructions, key=lambda r: len(r.images))
+            return best_recon
+        else:
+            return reconstructions
+
+    def _parse_reconstruction(self, reconstruction, num_input_images: int) -> Dict:
+        """解析重建结果"""
         try:
-            # 尝试使用pycolmap读取结果
-            try:
-                import pycolmap
-                reconstruction = pycolmap.Reconstruction(reconstruction_dir)
-                return self._parse_with_pycolmap(reconstruction, frame_paths, dense_info)
-            except ImportError:
-                # 使用文本文件解析
-                return self._parse_colmap_text_files(reconstruction_dir, frame_paths, dense_info)
-                
+            # 解析相机内参
+            intrinsics = self._parse_camera_intrinsics(reconstruction)
+            
+            # 解析位姿
+            poses = self._parse_camera_poses(reconstruction)
+            
+            # 计算统计信息
+            statistics = self._calculate_statistics(poses, reconstruction)
+            
+            # 点云信息
+            point_cloud_info = {
+                "num_points": len(reconstruction.points3D),
+                "num_cameras": len(reconstruction.cameras),
+                "num_registered_images": len(reconstruction.images),
+                "num_input_images": num_input_images,
+                "registration_ratio": len(reconstruction.images) / max(num_input_images, 1)
+            }
+            
+            return {
+                "success": True,
+                "intrinsics": intrinsics,
+                "poses": poses,
+                "statistics": statistics,
+                "frame_count": len(poses),
+                "point_cloud": point_cloud_info
+            }
+            
         except Exception as e:
+            print(f"解析重建结果失败: {e}")
             return {
                 "success": False,
-                "error": f"解析COLMAP结果失败: {str(e)}",
+                "error": f"解析失败: {str(e)}",
                 "intrinsics": None,
                 "poses": [],
-                "statistics": {"total_distance": 0, "average_speed": 0},
+                "statistics": {},
                 "frame_count": 0,
-                "trajectory_visualization": None,
-                "point_cloud": dense_info
+                "point_cloud": {}
             }
 
-    def _parse_with_pycolmap(self, reconstruction, frame_paths: List[str], dense_info: Dict) -> Dict:
-        """使用pycolmap解析结果"""
+    def _parse_camera_intrinsics(self, reconstruction) -> Dict:
+        """解析相机内参"""
+        if len(reconstruction.cameras) == 0:
+            raise ValueError("没有找到相机参数")
         
-        if len(reconstruction.cameras) == 0 or len(reconstruction.images) == 0:
-            raise ValueError("重建失败：没有找到相机或图像")
-        
-        # 获取相机内参
+        # 获取第一个相机的参数（假设所有图像使用同一相机）
         camera = list(reconstruction.cameras.values())[0]
         
-        # 安全地获取相机参数
-        try:
-            # 不同版本的PyColmap可能有不同的属性名
-            focal_length = None
-            focal_length_y = None
-            principal_point = [0, 0]
-            image_size = [0, 0]
-            camera_model = "UNKNOWN"
-            distortion = []
-            
-            # 尝试获取焦距
-            if hasattr(camera, 'params') and len(camera.params) > 0:
-                focal_length = float(camera.params[0])
-                if len(camera.params) > 1:
-                    focal_length_y = float(camera.params[1])
-                else:
-                    focal_length_y = focal_length
-                
-                # 尝试获取主点
-                if len(camera.params) > 3:
-                    principal_point = [float(camera.params[2]), float(camera.params[3])]
-                
-                # 畸变参数
-                if len(camera.params) > 4:
-                    distortion = [float(p) for p in camera.params[4:]]
-            
-            # 尝试获取图像尺寸
-            if hasattr(camera, 'width') and hasattr(camera, 'height'):
-                image_size = [camera.width, camera.height]
-                # 如果没有主点，使用图像中心
-                if principal_point == [0, 0]:
-                    principal_point = [camera.width / 2, camera.height / 2]
-            
-            # 尝试获取相机模型名称
-            if hasattr(camera, 'model_name'):
-                camera_model = camera.model_name
-            elif hasattr(camera, 'model'):
-                if hasattr(camera.model, 'name'):
-                    camera_model = camera.model.name
-                else:
-                    camera_model = str(camera.model)
-            elif hasattr(camera, 'model_id'):
-                # 将模型ID映射到名称
-                model_names = {
-                    0: "SIMPLE_PINHOLE",
-                    1: "PINHOLE", 
-                    2: "SIMPLE_RADIAL",
-                    3: "RADIAL",
-                    4: "OPENCV",
-                    5: "OPENCV_FISHEYE",
-                    6: "FULL_OPENCV",
-                    7: "FOV",
-                    8: "SIMPLE_RADIAL_FISHEYE",
-                    9: "RADIAL_FISHEYE",
-                    10: "THIN_PRISM_FISHEYE"
-                }
-                camera_model = model_names.get(camera.model_id, f"MODEL_{camera.model_id}")
-            
-            # 如果焦距为None，尝试从其他途径获取
-            if focal_length is None:
-                if hasattr(camera, 'focal_length'):
-                    focal_length = float(camera.focal_length)
-                    focal_length_y = focal_length
-                elif len(principal_point) > 0 and image_size[0] > 0:
-                    # 估算焦距（假设FOV约为60度）
-                    focal_length = image_size[0] * 0.5 / np.tan(np.radians(30))
-                    focal_length_y = focal_length
-                else:
-                    focal_length = 800.0  # 默认值
-                    focal_length_y = 800.0
-            
-            intrinsics = {
-                "focal_length": focal_length,
-                "focal_length_y": focal_length_y,
-                "principal_point": principal_point,
-                "image_size": image_size,
-                "camera_model": camera_model,
-                "distortion": distortion
+        # 获取基本参数
+        focal_length = float(camera.params[0]) if len(camera.params) > 0 else 800.0
+        focal_length_y = float(camera.params[1]) if len(camera.params) > 1 else focal_length
+        
+        # 获取主点
+        if len(camera.params) > 3:
+            principal_point = [float(camera.params[2]), float(camera.params[3])]
+        else:
+            principal_point = [camera.width / 2, camera.height / 2]
+        
+        # 获取畸变参数
+        distortion = [float(p) for p in camera.params[4:]] if len(camera.params) > 4 else []
+        
+        # 获取相机模型名称
+        camera_model = "PINHOLE"  # 默认值
+        if hasattr(camera, 'model_name'):
+            camera_model = camera.model_name
+        elif hasattr(camera, 'model_id'):
+            model_names = {
+                0: "SIMPLE_PINHOLE", 1: "PINHOLE", 2: "SIMPLE_RADIAL",
+                3: "RADIAL", 4: "OPENCV", 5: "OPENCV_FISHEYE"
             }
-            
-            print(f"解析相机内参: 焦距={focal_length:.2f}, 主点={principal_point}, 尺寸={image_size}, 模型={camera_model}")
-            
-        except Exception as e:
-            print(f"解析相机内参时出错: {e}")
-            # 提供默认的内参
-            intrinsics = {
-                "focal_length": 800.0,
-                "focal_length_y": 800.0,
-                "principal_point": [320.0, 240.0],
-                "image_size": [640, 480],
-                "camera_model": "PINHOLE",
-                "distortion": []
-            }
-        
-        # 获取相机位姿
-        poses = []
-        try:
-            print(f"开始解析 {len(reconstruction.images)} 张图像的位姿...")
-            
-            # 先检查第一个图像的属性来了解数据结构
-            if len(reconstruction.images) > 0:
-                first_image = list(reconstruction.images.values())[0]
-                print(f"第一个图像的属性: {[attr for attr in dir(first_image) if not attr.startswith('_')]}")
-                
-                # 检查位姿相关属性
-                if hasattr(first_image, 'qvec'):
-                    print(f"qvec 类型: {type(first_image.qvec)}, 值: {first_image.qvec}")
-                if hasattr(first_image, 'tvec'):
-                    print(f"tvec 类型: {type(first_image.tvec)}, 值: {first_image.tvec}")
-                if hasattr(first_image, 'camera_to_world'):
-                    print(f"camera_to_world 存在")
-                if hasattr(first_image, 'world_to_camera'):
-                    print(f"world_to_camera 存在")
-            
-            for idx, (image_id, image) in enumerate(reconstruction.images.items()):
-                print(f"处理图像 {idx+1}: ID={image_id}")
-                
-                # 检查图像是否已注册
-                is_registered = True
-                if hasattr(image, 'registered'):
-                    is_registered = image.registered
-                    print(f"  图像registered状态: {is_registered}")
-                
-                # 获取位姿数据
-                quat = None
-                trans = None
-                image_name = "unknown"
-                
-                # 方法1: 直接获取qvec和tvec (COLMAP格式)
-                if hasattr(image, 'qvec') and hasattr(image, 'tvec'):
-                    try:
-                        # PyColmap的qvec和tvec应该是numpy数组
-                        qvec_raw = image.qvec
-                        tvec_raw = image.tvec
-                        
-                        print(f"  原始qvec类型: {type(qvec_raw)}, 形状: {getattr(qvec_raw, 'shape', 'no shape')}")
-                        print(f"  原始tvec类型: {type(tvec_raw)}, 形状: {getattr(tvec_raw, 'shape', 'no shape')}")
-                        print(f"  qvec值: {qvec_raw}")
-                        print(f"  tvec值: {tvec_raw}")
-                        
-                        # 转换为列表
-                        if hasattr(qvec_raw, 'tolist'):
-                            quat = qvec_raw.tolist()
-                        else:
-                            quat = list(qvec_raw)
-                            
-                        if hasattr(tvec_raw, 'tolist'):
-                            trans = tvec_raw.tolist()
-                        else:
-                            trans = list(tvec_raw)
-                        
-                        print(f"  转换后quat: {quat}")
-                        print(f"  转换后trans: {trans}")
-                        
-                        # 检查数据有效性
-                        if len(quat) == 4 and len(trans) == 3:
-                            # 检查是否为有效的四元数（非零）
-                            quat_magnitude = sum(x*x for x in quat) ** 0.5
-                            if quat_magnitude > 1e-6:
-                                print(f"  位姿数据有效: quat_magnitude={quat_magnitude}")
-                            else:
-                                print(f"  四元数幅度太小，可能无效: {quat_magnitude}")
-                                quat = None
-                                trans = None
-                        else:
-                            print(f"  位姿数据格式错误: quat长度={len(quat)}, trans长度={len(trans)}")
-                            quat = None
-                            trans = None
-                            
-                    except Exception as e:
-                        print(f"  提取qvec/tvec失败: {e}")
-                        quat = None
-                        trans = None
-                
-                # 方法2: 尝试获取变换矩阵
-                elif hasattr(image, 'camera_to_world') or hasattr(image, 'world_to_camera'):
-                    try:
-                        print(f"  尝试从变换矩阵获取位姿")
-                        
-                        if hasattr(image, 'camera_to_world'):
-                            matrix = image.camera_to_world()
-                        elif hasattr(image, 'world_to_camera'):
-                            matrix = image.world_to_camera()
-                            # 需要求逆得到camera_to_world
-                            matrix = np.linalg.inv(matrix)
-                        
-                        print(f"  变换矩阵: {matrix}")
-                        
-                        # 从4x4变换矩阵提取旋转和平移
-                        rotation_matrix = matrix[:3, :3]
-                        translation = matrix[:3, 3]
-                        
-                        # 旋转矩阵转四元数
-                        from scipy.spatial.transform import Rotation
-                        r = Rotation.from_matrix(rotation_matrix)
-                        quat_xyzw = r.as_quat()  # [x, y, z, w]
-                        quat = [quat_xyzw[3], quat_xyzw[0], quat_xyzw[1], quat_xyzw[2]]  # [w, x, y, z]
-                        trans = translation.tolist()
-                        
-                        print(f"  从矩阵提取: quat={quat}, trans={trans}")
-                        
-                    except Exception as e:
-                        print(f"  从变换矩阵提取失败: {e}")
-                        quat = None
-                        trans = None
-                
-                # 获取图像名称
-                if hasattr(image, 'name'):
-                    image_name = image.name
-                elif hasattr(image, 'filename'):
-                    image_name = image.filename
-                else:
-                    image_name = f"image_{image_id}"
-                
-                # 如果仍然没有有效位姿，但图像已注册，尝试其他方法
-                if (not quat or not trans) and is_registered:
-                    print(f"  图像已注册但无法获取位姿，尝试其他属性...")
-                    
-                    # 列出所有数值属性
-                    numeric_attrs = []
-                    for attr_name in dir(image):
-                        if not attr_name.startswith('_'):
-                            try:
-                                attr_value = getattr(image, attr_name)
-                                if hasattr(attr_value, 'shape') or isinstance(attr_value, (list, tuple)):
-                                    numeric_attrs.append((attr_name, type(attr_value), getattr(attr_value, 'shape', len(attr_value) if hasattr(attr_value, '__len__') else 'no len')))
-                            except:
-                                pass
-                    print(f"  数值属性: {numeric_attrs}")
-                
-                # 如果仍然没有位姿数据，创建基于图像顺序的估计位姿
-                if not quat or not trans:
-                    if is_registered:
-                        print(f"  为已注册图像创建估计位姿")
-                        # 创建圆弧轨迹而不是直线
-                        angle = idx * 2 * np.pi / max(len(reconstruction.images), 1)
-                        radius = 2.0
-                        quat = [1, 0, 0, 0]  # 无旋转
-                        trans = [radius * np.cos(angle), radius * np.sin(angle), idx * 0.1]
-                    else:
-                        print(f"  图像未注册，跳过")
-                        continue
-                
-                # 转换为欧拉角
-                try:
-                    euler = self._quaternion_to_euler(quat)
-                except Exception as e:
-                    print(f"  四元数转欧拉角失败: {e}")
-                    euler = [0, 0, 0]
-                
-                pose = {
-                    "position": trans,
-                    "rotation_quaternion": quat,
-                    "rotation_euler": euler,
-                    "image_name": image_name,
-                    "is_registered": is_registered,
-                    "image_id": image_id
-                }
-                poses.append(pose)
-                print(f"  添加位姿: position={trans}, euler={[f'{x:.3f}' for x in euler]}")
-                        
-        except Exception as e:
-            print(f"解析相机位姿时出错: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # 如果无法解析位姿，创建圆弧虚拟位姿
-            print("创建圆弧虚拟位姿作为备用...")
-            poses = []
-            num_images = len(reconstruction.images) if hasattr(reconstruction, 'images') else len(frame_paths)
-            for i in range(min(num_images, len(frame_paths))):
-                angle = i * 2 * np.pi / max(num_images, 1)
-                radius = 3.0
-                pose = {
-                    "position": [radius * np.cos(angle), radius * np.sin(angle), i * 0.2],
-                    "rotation_quaternion": [np.cos(angle/2), 0, 0, np.sin(angle/2)],  # 绕Z轴旋转
-                    "rotation_euler": [0, 0, angle],
-                    "image_name": os.path.basename(frame_paths[i]) if i < len(frame_paths) else f"frame_{i}",
-                    "is_registered": False,
-                    "image_id": i
-                }
-                poses.append(pose)
-        
-        print(f"最终解析位姿数量: {len(poses)}")
-        
-        # 计算统计信息
-        statistics = self._calculate_trajectory_statistics(poses)
-        
-        # 点云信息
-        point_cloud_info = {
-            "num_points": len(reconstruction.points3D) if hasattr(reconstruction, 'points3D') else 0,
-            "dense_reconstruction": dense_info
-        }
-        
-        print(f"解析完成: {len(poses)} 个位姿, {point_cloud_info['num_points']} 个3D点")
+            camera_model = model_names.get(camera.model_id, f"MODEL_{camera.model_id}")
         
         return {
-            "success": True,
-            "intrinsics": intrinsics,
-            "poses": poses,
-            "statistics": statistics,
-            "frame_count": len(poses),
-            "trajectory_visualization": None,  # 将在主函数中生成
-            "point_cloud": point_cloud_info
+            "focal_length": focal_length,
+            "focal_length_y": focal_length_y,
+            "principal_point": principal_point,
+            "image_size": [camera.width, camera.height],
+            "camera_model": camera_model,
+            "distortion": distortion
         }
 
-    def _parse_colmap_text_files(self, reconstruction_dir: str, frame_paths: List[str], dense_info: Dict) -> Dict:
-        """解析COLMAP文本格式结果文件"""
-        
-        cameras_file = os.path.join(reconstruction_dir, "cameras.txt")
-        images_file = os.path.join(reconstruction_dir, "images.txt")
-        points_file = os.path.join(reconstruction_dir, "points3D.txt")
-        
-        if not all(os.path.exists(f) for f in [cameras_file, images_file]):
-            raise FileNotFoundError("COLMAP结果文件不完整")
-        
-        # 解析相机参数
-        intrinsics = None
-        with open(cameras_file, 'r') as f:
-            for line in f:
-                if line.startswith('#'):
-                    continue
-                parts = line.strip().split()
-                if len(parts) >= 5:
-                    camera_id = int(parts[0])
-                    model = parts[1]
-                    width = int(parts[2])
-                    height = int(parts[3])
-                    params = [float(x) for x in parts[4:]]
-                    
-                    intrinsics = {
-                        "focal_length": params[0],
-                        "focal_length_y": params[1] if len(params) > 1 else params[0],
-                        "principal_point": [params[2], params[3]] if len(params) > 3 else [width/2, height/2],
-                        "image_size": [width, height],
-                        "camera_model": model,
-                        "distortion": params[4:] if len(params) > 4 else []
-                    }
-                    break
-        
-        if intrinsics is None:
-            raise ValueError("无法解析相机内参")
-        
-        # 解析图像位姿
+    def _parse_camera_poses(self, reconstruction) -> List[Dict]:
+        """解析相机位姿"""
         poses = []
-        with open(images_file, 'r') as f:
-            for line in f:
-                if line.startswith('#'):
-                    continue
-                parts = line.strip().split()
-                if len(parts) >= 10:
-                    image_id = int(parts[0])
-                    qw, qx, qy, qz = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
-                    tx, ty, tz = float(parts[5]), float(parts[6]), float(parts[7])
-                    camera_id = int(parts[8])
-                    image_name = parts[9]
-                    
-                    quat = [qw, qx, qy, qz]
-                    trans = [tx, ty, tz]
-                    euler = self._quaternion_to_euler(quat)
-                    
-                    pose = {
-                        "position": trans,
-                        "rotation_quaternion": quat,
-                        "rotation_euler": euler,
-                        "image_name": image_name
-                    }
-                    poses.append(pose)
         
-        # 计算统计信息
-        statistics = self._calculate_trajectory_statistics(poses)
+        for image_id, image in reconstruction.images.items():
+            # 获取位姿数据 (兼容不同版本的 pycolmap)
+            quat = None
+            trans = None
+            
+            # 首次迭代时打印可用属性以便调试
+            if image_id == list(reconstruction.images.keys())[0]:
+                print(f"PyColmap Image 对象可用属性: {[attr for attr in dir(image) if not attr.startswith('_')]}")
+            
+            # 尝试多种可能的API
+            if hasattr(image, "qvec") and hasattr(image, "tvec"):
+                # 旧版 API: 直接访问属性
+                quat = image.qvec.tolist() if hasattr(image.qvec, 'tolist') else list(image.qvec)
+                trans = image.tvec.tolist() if hasattr(image.tvec, 'tolist') else list(image.tvec)
+            elif hasattr(image, "cam_from_world"):
+                # 新版 API: 使用 cam_from_world 属性
+                # cam_from_world 是一个 Rigid3d 对象，包含旋转和平移
+                cam_from_world = image.cam_from_world
+                if hasattr(cam_from_world, "rotation"):
+                    # 获取四元数
+                    rotation = cam_from_world.rotation
+                    if hasattr(rotation, "quat"):
+                        quat = rotation.quat.tolist()
+                    elif hasattr(rotation, "quaternion"):
+                        quat = rotation.quaternion.tolist()
+                    else:
+                        # 尝试从旋转矩阵转换
+                        print(f"警告: 无法直接获取四元数，尝试其他方法")
+                
+                if hasattr(cam_from_world, "translation"):
+                    trans = cam_from_world.translation.tolist()
+            elif hasattr(image, "projection_center"):
+                # 另一种可能: 使用 projection_center 作为位置
+                print(f"使用 projection_center 作为备选方案")
+                trans = image.projection_center().tolist()
+                # 尝试获取旋转
+                if hasattr(image, "rotation_matrix"):
+                    # 从旋转矩阵计算四元数
+                    print(f"从 rotation_matrix 计算四元数")
+            
+            # 如果仍然无法获取数据，尝试其他方法
+            if quat is None or trans is None:
+                print(f"警告: 无法获取图像 {image_id} 的完整位姿数据")
+                # 提供默认值以避免崩溃
+                if quat is None:
+                    quat = [1.0, 0.0, 0.0, 0.0]  # 单位四元数
+                if trans is None:
+                    trans = [0.0, 0.0, 0.0]  # 原点
+            
+            # 转换为欧拉角
+            euler = self._quaternion_to_euler(quat)
+            
+            # 获取图像名称
+            image_name = image.name if hasattr(image, 'name') else f"image_{image_id}"
+            
+            pose = {
+                "position": trans,
+                "rotation_quaternion": quat,
+                "rotation_euler": euler,
+                "image_name": image_name,
+                "image_id": image_id
+            }
+            poses.append(pose)
         
-        # 计算点云数量
-        num_points = 0
-        if os.path.exists(points_file):
-            with open(points_file, 'r') as f:
-                for line in f:
-                    if not line.startswith('#') and line.strip():
-                        num_points += 1
+        # 按图像名称排序，确保顺序
+        poses.sort(key=lambda x: x["image_name"])
         
-        point_cloud_info = {
-            "num_points": num_points,
-            "dense_reconstruction": dense_info
-        }
-        
-        return {
-            "success": True,
-            "intrinsics": intrinsics,
-            "poses": poses,
-            "statistics": statistics,
-            "frame_count": len(poses),
-            "trajectory_visualization": None,
-            "point_cloud": point_cloud_info
-        }
+        return poses
 
     def _quaternion_to_euler(self, quat: List[float]) -> List[float]:
         """四元数转欧拉角"""
@@ -1111,42 +434,224 @@ class VideoCameraEstimator:
         
         return [roll, pitch, yaw]
 
-    def _calculate_trajectory_statistics(self, poses: List[Dict]) -> Dict:
-        """计算轨迹统计信息"""
+    def _calculate_statistics(self, poses: List[Dict], reconstruction) -> Dict:
+        """计算统计信息"""
         if len(poses) < 2:
-            return {"total_distance": 0, "average_speed": 0, "num_poses": len(poses)}
+            return {
+                "total_distance": 0.0,
+                "average_speed": 0.0,
+                "num_poses": len(poses),
+                "num_3d_points": len(reconstruction.points3D)
+            }
         
-        total_distance = 0
+        # 计算轨迹总长度
+        total_distance = 0.0
         for i in range(1, len(poses)):
             pos1 = np.array(poses[i-1]["position"])
             pos2 = np.array(poses[i]["position"])
             distance = np.linalg.norm(pos2 - pos1)
             total_distance += distance
         
-        average_speed = total_distance / (len(poses) - 1)
+        average_speed = total_distance / (len(poses) - 1) if len(poses) > 1 else 0.0
         
         return {
             "total_distance": float(total_distance),
             "average_speed": float(average_speed),
-            "num_poses": len(poses)
+            "num_poses": len(poses),
+            "num_3d_points": len(reconstruction.points3D),
+            "mean_track_length": np.mean([len(point.track.elements) for point in reconstruction.points3D.values()]) if len(reconstruction.points3D) > 0 else 0.0
         }
 
-    def _create_colmap_visualization(self, poses: List[Dict]) -> np.ndarray:
-        """创建COLMAP轨迹可视化（与其他算法保持一致的3D立体效果）"""
-        print(f"创建轨迹可视化，位姿数量: {len(poses)}")
-        
-        if len(poses) == 0:
-            return self._create_empty_visualization_array()
-        
-        # 提取位置信息
-        positions = np.array([pose["position"] for pose in poses])
-        print(f"位置数据形状: {positions.shape}")
-        print(f"位置范围: X=[{positions[:, 0].min():.3f}, {positions[:, 0].max():.3f}], Y=[{positions[:, 1].min():.3f}, {positions[:, 1].max():.3f}], Z=[{positions[:, 2].min():.3f}, {positions[:, 2].max():.3f}]")
+
+class ImageSequenceCameraEstimator:
+    """图片序列相机参数估计节点"""
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "images": ("IMAGE", {
+                    "tooltip": "输入图片序列"
+                }),
+            },
+            "optional": {
+                "colmap_feature_type": (["sift", "superpoint", "disk"], {
+                    "default": "sift",
+                    "tooltip": "COLMAP特征检测器类型，SIFT最稳定"
+                }),
+                "colmap_matcher_type": (["exhaustive", "sequential", "spatial"], {
+                    "default": "sequential",
+                    "tooltip": "COLMAP匹配策略，sequential适合有序序列"
+                }),
+                "colmap_quality": (["low", "medium", "high", "extreme"], {
+                    "default": "medium",
+                    "tooltip": "COLMAP重建质量，higher质量需要更多时间"
+                }),
+                "enable_dense_reconstruction": ("BOOLEAN", {
+                    "default": False,
+                    "tooltip": "是否启用密集重建（需要更多计算资源和CUDA支持）"
+                }),
+                "enable_visualization": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "是否生成轨迹可视化图像"
+                }),
+                "output_format": (["json", "detailed_json"], {
+                    "default": "detailed_json",
+                    "tooltip": "输出格式，详细模式包含更多统计信息"
+                })
+            }
+        }
+
+    RETURN_TYPES = ("STRING", "IMAGE", "STRING", "STRING", "STRING")
+    RETURN_NAMES = ("intrinsics_json", "trajectory_visualization", "poses_json", "statistics_json", "point_cloud_info")
+    FUNCTION = "estimate_camera_parameters"
+    CATEGORY = "💃VVL/VideoCamera"
+
+    def __init__(self):
+        try:
+            self.estimator = ColmapCameraEstimator()
+        except ImportError as e:
+            print(f"COLMAP初始化失败: {e}")
+            self.estimator = None
+
+    def estimate_camera_parameters(self, images, 
+                                 colmap_feature_type: str = "sift",
+                                 colmap_matcher_type: str = "sequential", 
+                                 colmap_quality: str = "medium",
+                                 enable_dense_reconstruction: bool = False,
+                                 enable_visualization: bool = True,
+                                 output_format: str = "detailed_json") -> tuple:
+        """从图片序列估计相机参数的主函数"""
         
         try:
-            # 使用matplotlib创建3D立体可视化（与其他算法一致）
+            if self.estimator is None:
+                raise RuntimeError("COLMAP初始化失败，请检查PyColmap安装")
+            
+            # 检查输入
+            if images is None:
+                raise ValueError("未提供图片输入")
+            
+            # 转换输入格式
+            if isinstance(images, torch.Tensor):
+                if images.dim() == 4:  # Batch of images
+                    image_list = [images[i] for i in range(images.shape[0])]
+                else:  # Single image
+                    image_list = [images]
+            elif isinstance(images, list):
+                image_list = images
+            else:
+                raise ValueError(f"不支持的图片输入格式: {type(images)}")
+            
+            print(f"开始处理 {len(image_list)} 张图片")
+            
+            # 使用COLMAP进行估计
+            result = self.estimator.estimate_from_images(
+                images=image_list,
+                colmap_feature_type=colmap_feature_type,
+                colmap_matcher_type=colmap_matcher_type,
+                colmap_quality=colmap_quality,
+                enable_dense_reconstruction=enable_dense_reconstruction
+            )
+            
+            if not result["success"]:
+                raise RuntimeError(f"相机参数估计失败: {result.get('error', '未知错误')}")
+            
+            # 准备输出
+            intrinsics_json = self._format_intrinsics_output(result["intrinsics"], output_format)
+            poses_json = self._format_poses_output(result["poses"], output_format)
+            statistics_json = self._format_statistics_output(result["statistics"], result, output_format)
+            point_cloud_info = self._format_point_cloud_output(result["point_cloud"], output_format)
+            
+            # 处理可视化图像
+            if enable_visualization and result["poses"]:
+                trajectory_img = self._create_trajectory_visualization(result["poses"])
+            else:
+                trajectory_img = self._create_empty_visualization()
+            
+            print(f"成功处理 {result['frame_count']} 张图片")
+            if result['intrinsics']:
+                print(f"估计的焦距: {result['intrinsics']['focal_length']:.2f}")
+            
+            return (intrinsics_json, trajectory_img, poses_json, statistics_json, point_cloud_info)
+            
+        except Exception as e:
+            error_msg = f"图片序列相机参数估计出错: {str(e)}"
+            print(error_msg)
+            
+            # 返回错误信息
+            error_json = json.dumps({"error": error_msg, "success": False}, ensure_ascii=False, indent=2)
+            empty_img = self._create_empty_visualization()
+            
+            return (error_json, empty_img, error_json, error_json, error_json)
+
+    def _format_intrinsics_output(self, intrinsics: Dict, output_format: str) -> str:
+        """格式化内参输出"""
+        if output_format == "json":
+            simplified = {
+                "focal_length": intrinsics["focal_length"],
+                "principal_point": intrinsics["principal_point"],
+                "image_size": intrinsics["image_size"]
+            }
+            return json.dumps(simplified, ensure_ascii=False, indent=2)
+        else:
+            return json.dumps(intrinsics, ensure_ascii=False, indent=2)
+
+    def _format_poses_output(self, poses: List[Dict], output_format: str) -> str:
+        """格式化位姿输出"""
+        if output_format == "json":
+            simplified_poses = []
+            for i, pose in enumerate(poses):
+                simplified_poses.append({
+                    "frame": i,
+                    "position": pose["position"],
+                    "rotation_euler": pose["rotation_euler"]
+                })
+            return json.dumps(simplified_poses, ensure_ascii=False, indent=2)
+        else:
+            detailed_poses = []
+            for i, pose in enumerate(poses):
+                detailed_pose = pose.copy()
+                detailed_pose["frame"] = i
+                detailed_poses.append(detailed_pose)
+            return json.dumps(detailed_poses, ensure_ascii=False, indent=2)
+
+    def _format_statistics_output(self, statistics: Dict, result: Dict, output_format: str) -> str:
+        """格式化统计信息输出"""
+        if output_format == "json":
+            simplified_stats = {
+                "frame_count": result["frame_count"],
+                "total_distance": statistics.get("total_distance", 0),
+                "num_3d_points": statistics.get("num_3d_points", 0),
+                "success": result["success"]
+            }
+            return json.dumps(simplified_stats, ensure_ascii=False, indent=2)
+        else:
+            detailed_stats = statistics.copy()
+            detailed_stats.update({
+                "frame_count": result["frame_count"],
+                "success": result["success"]
+            })
+            return json.dumps(detailed_stats, ensure_ascii=False, indent=2)
+
+    def _format_point_cloud_output(self, point_cloud_info: Dict, output_format: str) -> str:
+        """格式化点云信息输出"""
+        if output_format == "json":
+            simplified = {
+                "num_points": point_cloud_info.get("num_points", 0),
+                "registration_ratio": point_cloud_info.get("registration_ratio", 0)
+            }
+            return json.dumps(simplified, ensure_ascii=False, indent=2)
+        else:
+            return json.dumps(point_cloud_info, ensure_ascii=False, indent=2)
+
+    def _create_trajectory_visualization(self, poses: List[Dict]) -> torch.Tensor:
+        """创建轨迹可视化"""
+        try:
             import matplotlib.pyplot as plt
             from mpl_toolkits.mplot3d import Axes3D
+            
+            # 提取位置信息
+            positions = np.array([pose["position"] for pose in poses])
             
             fig = plt.figure(figsize=(12, 9))
             ax = fig.add_subplot(111, projection='3d')
@@ -1169,37 +674,14 @@ class VideoCameraEstimator:
                 ax.scatter([positions[-1, 0]], [positions[-1, 1]], [positions[-1, 2]], 
                           c='red', s=150, marker='o', label='End', edgecolors='darkred', linewidth=2)
             
-            # 添加相机方向指示器（每5个位姿显示一个）
-            for i in range(0, len(poses), max(1, len(poses)//10)):
-                pose = poses[i]
-                pos = pose["position"]
-                
-                # 从旋转四元数计算方向向量
-                if "rotation_quaternion" in pose:
-                    quat = pose["rotation_quaternion"]
-                    # 简化的方向向量（相机朝向Z轴负方向）
-                    direction_length = max(0.5, np.linalg.norm(positions.max(axis=0) - positions.min(axis=0)) * 0.1)
-                    
-                    # 计算旋转后的方向向量
-                    qw, qx, qy, qz = quat
-                    # 将Z轴负方向向量旋转
-                    dir_x = 2 * (qx*qz + qw*qy) * direction_length
-                    dir_y = 2 * (qy*qz - qw*qx) * direction_length  
-                    dir_z = -(1 - 2*(qx*qx + qy*qy)) * direction_length
-                    
-                    ax.quiver(pos[0], pos[1], pos[2], dir_x, dir_y, dir_z, 
-                             color='orange', alpha=0.6, arrow_length_ratio=0.1)
-            
             # 设置坐标轴
             ax.set_xlabel('X (meters)', fontsize=12)
             ax.set_ylabel('Y (meters)', fontsize=12)
             ax.set_zlabel('Z (meters)', fontsize=12)
             ax.set_title('COLMAP Camera Trajectory (3D View)', fontsize=14, fontweight='bold')
             
-            # 添加图例
+            # 添加图例和颜色条
             ax.legend(loc='upper right', fontsize=10)
-            
-            # 添加颜色条
             cbar = plt.colorbar(scatter, ax=ax, shrink=0.6, aspect=20)
             cbar.set_label('Time Progress', fontsize=10)
             
@@ -1213,14 +695,10 @@ class VideoCameraEstimator:
             ax.set_ylim(mid_y - max_range, mid_y + max_range)
             ax.set_zlim(mid_z - max_range, mid_z + max_range)
             
-            # 设置网格
             ax.grid(True, alpha=0.3)
-            
-            # 调整视角
             ax.view_init(elev=20, azim=45)
             
             # 保存为图像
-            import tempfile
             with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
                 plt.savefig(tmp.name, dpi=120, bbox_inches='tight', facecolor='white')
                 plt.close()
@@ -1232,459 +710,34 @@ class VideoCameraEstimator:
                 if img is not None:
                     # BGR转RGB
                     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    print(f"成功创建3D轨迹可视化，图像尺寸: {img.shape}")
-                    return img
+                    img_tensor = torch.from_numpy(img.astype(np.float32) / 255.0)
+                    return img_tensor.unsqueeze(0)
                 else:
-                    print("读取生成的可视化图像失败")
-                    return self._create_empty_visualization_array()
+                    return self._create_empty_visualization()
         
         except Exception as e:
-            print(f"创建3D可视化失败: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # 如果3D可视化失败，创建备用的2D可视化
-            return self._create_fallback_2d_visualization(positions)
-
-    def _create_fallback_2d_visualization(self, positions: np.ndarray) -> np.ndarray:
-        """创建备用2D可视化（当3D可视化失败时使用）"""
-        try:
-            import matplotlib.pyplot as plt
-            
-            fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 10))
-            fig.suptitle('COLMAP Camera Trajectory (2D Views)', fontsize=16, fontweight='bold')
-            
-            # XY视图（俯视图）
-            if len(positions) > 1:
-                ax1.plot(positions[:, 0], positions[:, 1], 'b-', linewidth=2, alpha=0.7)
-            colors = plt.cm.viridis(np.linspace(0, 1, len(positions)))
-            ax1.scatter(positions[:, 0], positions[:, 1], c=colors, s=50, alpha=0.8, edgecolors='black')
-            if len(positions) > 0:
-                ax1.scatter(positions[0, 0], positions[0, 1], c='green', s=100, marker='^', label='Start')
-            if len(positions) > 1:
-                ax1.scatter(positions[-1, 0], positions[-1, 1], c='red', s=100, marker='o', label='End')
-            ax1.set_xlabel('X (meters)')
-            ax1.set_ylabel('Y (meters)')
-            ax1.set_title('Top View (XY)')
-            ax1.legend()
-            ax1.grid(True, alpha=0.3)
-            
-            # XZ视图（侧视图）
-            if len(positions) > 1:
-                ax2.plot(positions[:, 0], positions[:, 2], 'g-', linewidth=2, alpha=0.7)
-            ax2.scatter(positions[:, 0], positions[:, 2], c=colors, s=50, alpha=0.8, edgecolors='black')
-            if len(positions) > 0:
-                ax2.scatter(positions[0, 0], positions[0, 2], c='green', s=100, marker='^')
-            if len(positions) > 1:
-                ax2.scatter(positions[-1, 0], positions[-1, 2], c='red', s=100, marker='o')
-            ax2.set_xlabel('X (meters)')
-            ax2.set_ylabel('Z (meters)')
-            ax2.set_title('Side View (XZ)')
-            ax2.grid(True, alpha=0.3)
-            
-            # YZ视图（正视图）
-            if len(positions) > 1:
-                ax3.plot(positions[:, 1], positions[:, 2], 'r-', linewidth=2, alpha=0.7)
-            ax3.scatter(positions[:, 1], positions[:, 2], c=colors, s=50, alpha=0.8, edgecolors='black')
-            if len(positions) > 0:
-                ax3.scatter(positions[0, 1], positions[0, 2], c='green', s=100, marker='^')
-            if len(positions) > 1:
-                ax3.scatter(positions[-1, 1], positions[-1, 2], c='red', s=100, marker='o')
-            ax3.set_xlabel('Y (meters)')
-            ax3.set_ylabel('Z (meters)')
-            ax3.set_title('Front View (YZ)')
-            ax3.grid(True, alpha=0.3)
-            
-            # 统计信息面板
-            ax4.axis('off')
-            stats_text = f"""COLMAP Trajectory Statistics
-            
-Total Poses: {len(positions)}
-Position Range:
-  X: [{positions[:, 0].min():.3f}, {positions[:, 0].max():.3f}]
-  Y: [{positions[:, 1].min():.3f}, {positions[:, 1].max():.3f}]
-  Z: [{positions[:, 2].min():.3f}, {positions[:, 2].max():.3f}]
-
-Path Length: {np.sum(np.linalg.norm(np.diff(positions, axis=0), axis=1)):.3f}m"""
-            
-            ax4.text(0.1, 0.9, stats_text, transform=ax4.transAxes, fontsize=11,
-                    verticalalignment='top', fontfamily='monospace',
-                    bbox=dict(boxstyle='round', facecolor='lightgray', alpha=0.8))
-            
-            plt.tight_layout()
-            
-            # 保存为图像
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as tmp:
-                plt.savefig(tmp.name, dpi=120, bbox_inches='tight', facecolor='white')
-                plt.close()
-                
-                # 读取图像
-                img = cv2.imread(tmp.name)
-                os.unlink(tmp.name)
-                
-                if img is not None:
-                    # BGR转RGB
-                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-                    return img
-                else:
-                    return self._create_empty_visualization_array()
-        
-        except Exception as e:
-            print(f"创建备用2D可视化也失败: {e}")
-            return self._create_empty_visualization_array()
-
-    def _create_empty_visualization_array(self) -> np.ndarray:
-        """创建空的可视化图像数组"""
-        # 创建一个简单的占位图像
-        img = np.ones((400, 600, 3), dtype=np.uint8) * 50  # 深灰色背景
-        
-        # 添加文字提示
-        try:
-            cv2.putText(img, "COLMAP Visualization", (150, 180), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
-            cv2.putText(img, "No Trajectory Data", (170, 220), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (200, 200, 200), 2)
-        except:
-            pass  # 如果添加文字失败，返回纯色图像
-        
-        return img
-
-    def _format_point_cloud_output(self, point_cloud_info: Dict, output_format: str) -> str:
-        """格式化点云信息输出"""
-        if not point_cloud_info:
-            return json.dumps({"point_cloud": "未生成"}, ensure_ascii=False, indent=2)
-        
-        if output_format == "json":
-            # 简化版本
-            simplified = {
-                "num_points": point_cloud_info.get("num_points", 0),
-                "has_dense": "dense_reconstruction" in point_cloud_info
-            }
-            return json.dumps(simplified, ensure_ascii=False, indent=2)
-        else:
-            # 详细版本
-            return json.dumps(point_cloud_info, ensure_ascii=False, indent=2)
-
-    def _is_valid_video_format(self, video_path: str) -> bool:
-        """验证视频格式"""
-        valid_extensions = ['.mp4', '.avi', '.mov', '.mkv', '.wmv', '.flv', '.webm']
-        ext = os.path.splitext(video_path)[1].lower()
-        return ext in valid_extensions
-
-    def _format_intrinsics_output(self, intrinsics: Dict, output_format: str) -> str:
-        """格式化内参输出"""
-        if output_format == "json":
-            # 简化版本，只包含核心参数
-            simplified = {
-                "focal_length": intrinsics["focal_length"],
-                "principal_point": intrinsics["principal_point"],
-                "image_size": intrinsics["image_size"]
-            }
-            return json.dumps(simplified, ensure_ascii=False, indent=2)
-        else:
-            # 详细版本
-            return json.dumps(intrinsics, ensure_ascii=False, indent=2)
-
-    def _format_poses_output(self, poses: List[Dict], output_format: str) -> str:
-        """格式化位姿输出"""
-        if output_format == "json":
-            # 简化版本，只包含位置和欧拉角
-            simplified_poses = []
-            for i, pose in enumerate(poses):
-                simplified_poses.append({
-                    "frame": i,
-                    "position": pose["position"],
-                    "rotation_euler": pose["rotation_euler"]
-                })
-            return json.dumps(simplified_poses, ensure_ascii=False, indent=2)
-        else:
-            # 详细版本
-            detailed_poses = []
-            for i, pose in enumerate(poses):
-                detailed_pose = pose.copy()
-                detailed_pose["frame"] = i
-                detailed_poses.append(detailed_pose)
-            return json.dumps(detailed_poses, ensure_ascii=False, indent=2)
-
-    def _format_statistics_output(self, statistics: Dict, result: Dict, output_format: str) -> str:
-        """格式化统计信息输出"""
-        if output_format == "json":
-            # 简化版本
-            simplified_stats = {
-                "frame_count": result["frame_count"],
-                "total_distance": statistics["total_distance"],
-                "success": result["success"]
-            }
-            return json.dumps(simplified_stats, ensure_ascii=False, indent=2)
-        else:
-            # 详细版本
-            detailed_stats = statistics.copy()
-            detailed_stats.update({
-                "frame_count": result["frame_count"],
-                "success": result["success"],
-                "processing_info": {
-                    "total_poses": len(result["poses"]),
-                    "has_visualization": result.get("trajectory_visualization") is not None
-                }
-            })
-            return json.dumps(detailed_stats, ensure_ascii=False, indent=2)
-
-    def _prepare_visualization_image(self, trajectory_data) -> torch.Tensor:
-        """准备可视化图像"""
-        try:
-            if isinstance(trajectory_data, list):
-                # 从列表转换为numpy数组
-                img_array = np.array(trajectory_data, dtype=np.uint8)
-            elif isinstance(trajectory_data, np.ndarray):
-                # 直接使用numpy数组（来自新的COLMAP可视化）
-                img_array = trajectory_data
-            else:
-                img_array = trajectory_data
-            
-            # 确保图像是正确的格式
-            if len(img_array.shape) == 3 and img_array.shape[2] == 3:
-                # 确保数据类型是uint8
-                if img_array.dtype != np.uint8:
-                    if img_array.max() <= 1.0:
-                        # 如果是0-1范围，转换为0-255
-                        img_array = (img_array * 255).astype(np.uint8)
-                    else:
-                        img_array = img_array.astype(np.uint8)
-                
-                # 如果图像已经是RGB格式（来自matplotlib），不需要BGR转RGB
-                # 只有从OpenCV读取的图像才需要BGR转RGB转换
-                # 由于我们的新可视化直接返回RGB格式，这里不需要转换
-                
-                # 转换为torch tensor (H, W, C) -> (1, H, W, C)
-                img_tensor = torch.from_numpy(img_array.astype(np.float32) / 255.0)
-                return img_tensor.unsqueeze(0)
-            else:
-                print(f"图像格式不正确: shape={img_array.shape}")
-                return self._create_empty_visualization()
-                
-        except Exception as e:
-            print(f"可视化图像处理错误: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"创建可视化失败: {e}")
             return self._create_empty_visualization()
 
     def _create_empty_visualization(self) -> torch.Tensor:
         """创建空的可视化图像"""
-        # 创建一个简单的占位图像
-        img = np.ones((400, 400, 3), dtype=np.float32) * 0.1  # 深灰色背景
+        img = np.ones((400, 600, 3), dtype=np.float32) * 0.1
         
-        # 添加文字提示
         try:
             img_uint8 = (img * 255).astype(np.uint8)
-            cv2.putText(img_uint8, "No Trajectory", (120, 180), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
-            cv2.putText(img_uint8, "Visualization", (110, 220), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
+            cv2.putText(img_uint8, "No Trajectory", (180, 180), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
+            cv2.putText(img_uint8, "Visualization", (170, 220), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 2)
             img = img_uint8.astype(np.float32) / 255.0
         except:
-            pass  # 如果添加文字失败，返回纯色图像
+            pass
         
         return torch.from_numpy(img).unsqueeze(0)
 
-    def _estimate_with_colmap_cli(self, video_path: str, frame_interval: int, max_frames: int,
-                                feature_type: str, matcher_type: str, quality: str, enable_dense: bool) -> Dict:
-        """使用命令行COLMAP进行相机参数估计（原有实现）"""
-        
-        # 创建临时工作目录
-        temp_dir = tempfile.mkdtemp(prefix="colmap_estimation_")
-        images_dir = os.path.join(temp_dir, "images")
-        database_path = os.path.join(temp_dir, "database.db")
-        sparse_dir = os.path.join(temp_dir, "sparse")
-        dense_dir = os.path.join(temp_dir, "dense")
-        
-        try:
-            os.makedirs(images_dir, exist_ok=True)
-            os.makedirs(sparse_dir, exist_ok=True)
-            if enable_dense:
-                os.makedirs(dense_dir, exist_ok=True)
-            
-            # 1. 提取视频帧
-            print("提取视频帧...")
-            frame_paths = self._extract_frames_for_colmap(video_path, images_dir, frame_interval, max_frames)
-            
-            if len(frame_paths) < 3:
-                raise ValueError("提取的帧数过少（< 3），无法进行重建")
-            
-            # 2. 特征提取
-            print(f"使用 {feature_type} 进行特征提取...")
-            self._run_colmap_feature_extraction(database_path, images_dir, feature_type, quality)
-            
-            # 3. 特征匹配
-            print(f"使用 {matcher_type} 进行特征匹配...")
-            self._run_colmap_matching(database_path, matcher_type)
-            
-            # 4. 稀疏重建
-            print("进行稀疏重建...")
-            reconstruction_dir = os.path.join(sparse_dir, "0")
-            os.makedirs(reconstruction_dir, exist_ok=True)
-            self._run_colmap_sparse_reconstruction(database_path, images_dir, reconstruction_dir)
-            
-            # 5. 密集重建（可选）
-            dense_info = {}
-            if enable_dense:
-                print("进行密集重建...")
-                dense_info = self._run_colmap_dense_reconstruction(images_dir, reconstruction_dir, dense_dir)
-            
-            # 6. 解析结果
-            print("解析重建结果...")
-            result = self._parse_colmap_results(reconstruction_dir, frame_paths, dense_info)
-            
-            # 7. 生成可视化
-            if result["success"]:
-                result["trajectory_visualization"] = self._create_colmap_visualization(result["poses"])
-            
-            return result
-            
-        except Exception as e:
-            print(f"COLMAP 估计过程出错: {e}")
-            return {
-                "success": False,
-                "error": str(e),
-                "intrinsics": None,
-                "poses": [],
-                "statistics": {"total_distance": 0, "average_speed": 0},
-                "frame_count": 0,
-                "trajectory_visualization": None,
-                "point_cloud": {}
-            }
-        finally:
-            # 清理临时文件
-            try:
-                shutil.rmtree(temp_dir)
-            except:
-                pass
-
-    def _extract_frames_for_colmap(self, video_path: str, output_dir: str, interval: int, max_frames: int) -> List[str]:
-        """为COLMAP提取视频帧"""
-        cap = cv2.VideoCapture(video_path)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        frame_paths = []
-        frame_count = 0
-        current_frame = 0
-        
-        while current_frame < total_frames and frame_count < max_frames:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, current_frame)
-            ret, frame = cap.read()
-            
-            if ret:
-                # 保存帧
-                frame_filename = f"frame_{frame_count:06d}.jpg"
-                frame_path = os.path.join(output_dir, frame_filename)
-                cv2.imwrite(frame_path, frame, [cv2.IMWRITE_JPEG_QUALITY, 95])
-                frame_paths.append(frame_path)
-                frame_count += 1
-            
-            current_frame += interval
-        
-        cap.release()
-        return frame_paths
-
-# 第二个节点：视频帧提取器（辅助节点）
-class VideoFrameExtractor:
-    """视频帧提取节点（辅助功能）"""
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "video_path": ("STRING", {
-                    "default": "",
-                    "tooltip": "输入视频文件路径"
-                }),
-                "frame_indices": ("STRING", {
-                    "default": "0,10,20,30",
-                    "tooltip": "要提取的帧索引，用逗号分隔"
-                })
-            },
-            "optional": {
-                "resize_width": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 2048,
-                    "tooltip": "调整图像宽度，0表示保持原尺寸"
-                }),
-                "resize_height": ("INT", {
-                    "default": 0,
-                    "min": 0,
-                    "max": 2048,
-                    "tooltip": "调整图像高度，0表示保持原尺寸"
-                })
-            }
-        }
-
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("extracted_frames", "frame_info")
-    OUTPUT_IS_LIST = (True, False)
-    FUNCTION = "extract_frames"
-    CATEGORY = "💃VVL/VideoCamera"
-
-    def extract_frames(self, video_path: str, frame_indices: str, resize_width: int = 0, resize_height: int = 0) -> tuple:
-        """提取指定的视频帧"""
-        try:
-            if not os.path.exists(video_path):
-                raise FileNotFoundError(f"视频文件不存在: {video_path}")
-            
-            # 解析帧索引
-            indices = [int(x.strip()) for x in frame_indices.split(',') if x.strip()]
-            
-            cap = cv2.VideoCapture(video_path)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            
-            extracted_frames = []
-            extracted_info = []
-            
-            for idx in indices:
-                if 0 <= idx < total_frames:
-                    cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
-                    ret, frame = cap.read()
-                    
-                    if ret:
-                        # BGR转RGB
-                        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                        
-                        # 调整尺寸
-                        if resize_width > 0 and resize_height > 0:
-                            frame = cv2.resize(frame, (resize_width, resize_height))
-                        
-                        # 转换为torch tensor
-                        frame_tensor = torch.from_numpy(frame.astype(np.float32) / 255.0)
-                        extracted_frames.append(frame_tensor)
-                        
-                        extracted_info.append({
-                            "frame_index": idx,
-                            "shape": list(frame.shape)
-                        })
-            
-            cap.release()
-            
-            info_json = json.dumps({
-                "total_extracted": len(extracted_frames),
-                "video_total_frames": total_frames,
-                "frame_details": extracted_info
-            }, ensure_ascii=False, indent=2)
-            
-            return (extracted_frames, info_json)
-            
-        except Exception as e:
-            error_msg = f"帧提取错误: {str(e)}"
-            print(error_msg)
-            
-            # 返回空图像和错误信息
-            empty_frame = torch.zeros((400, 400, 3), dtype=torch.float32)
-            error_json = json.dumps({"error": error_msg}, ensure_ascii=False, indent=2)
-            
-            return ([empty_frame], error_json)
-
 # 节点映射
 NODE_CLASS_MAPPINGS = {
-    "VideoCameraEstimator": VideoCameraEstimator,
-    "VideoFrameExtractor": VideoFrameExtractor
+    "ImageSequenceCameraEstimator": ImageSequenceCameraEstimator
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "VideoCameraEstimator": "VVL Video Camera Estimator",
-    "VideoFrameExtractor": "VVL Video Frame Extractor"
+    "ImageSequenceCameraEstimator": "VVL Image Sequence Camera Estimator"
 } 
