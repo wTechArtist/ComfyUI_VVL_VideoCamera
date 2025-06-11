@@ -18,28 +18,79 @@ except ImportError:
         IMAGE = "IMAGE"
 
 class ColmapCameraEstimator:
-    """使用COLMAP进行相机参数估计的核心类"""
+    """使用原生COLMAP进行相机参数估计的核心类"""
 
     def __init__(self):
         self.check_dependencies()
 
     def check_dependencies(self):
-        """检查PyColmap依赖"""
+        """检查原生COLMAP依赖（必需）"""
+        # 检查原生COLMAP是否可用（必需）
+        try:
+            import subprocess
+            result = subprocess.run(['colmap', 'help'], capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                self.colmap_available = True
+                print("✓ 原生COLMAP 已成功检测到")
+                
+                # 检测COLMAP版本和GPU支持
+                self._detect_colmap_capabilities()
+            else:
+                raise RuntimeError("原生COLMAP命令执行失败")
+        except (subprocess.TimeoutExpired, FileNotFoundError, Exception) as e:
+            raise RuntimeError(f"未找到原生COLMAP。请安装COLMAP并确保其在系统PATH中。错误: {e}")
+        
+        # 检查PyColmap（仅用于读取结果文件）
         try:
             import pycolmap
             self.pycolmap = pycolmap
-            print("PyColmap 已成功导入")
+            print("✓ PyColmap 可用于读取COLMAP结果文件")
         except ImportError as e:
-            print(f"PyColmap 导入失败: {e}")
-            print("请安装 PyColmap: pip install pycolmap")
-            raise ImportError("PyColmap 是必需的依赖")
+            raise ImportError(f"PyColmap 是必需的依赖（用于读取COLMAP结果）: {e}")
+
+    def _detect_colmap_capabilities(self):
+        """检测COLMAP的版本和功能"""
+        import subprocess
+        
+        # 检测版本
+        try:
+            result = subprocess.run(['colmap'], capture_output=True, text=True, timeout=5)
+            self.colmap_version = "unknown"
+            if "COLMAP" in result.stderr:
+                # 尝试提取版本信息
+                for line in result.stderr.split('\n'):
+                    if 'COLMAP' in line and ('3.' in line or '4.' in line):
+                        self.colmap_version = line.strip()
+                        break
+            print(f"COLMAP版本: {self.colmap_version}")
+        except:
+            self.colmap_version = "unknown"
+        
+        # 检测GPU支持
+        self.gpu_available = self._check_gpu_support()
+        print(f"GPU支持: {'可用' if self.gpu_available else '不可用'}")
+
+    def _check_gpu_support(self) -> bool:
+        """检测GPU支持"""
+        try:
+            import subprocess
+            # 尝试运行简单的GPU测试
+            result = subprocess.run([
+                'colmap', 'feature_extractor', '--help'
+            ], capture_output=True, text=True, timeout=5)
+            
+            # 检查帮助信息中是否包含GPU相关选项
+            return 'gpu' in result.stdout.lower() or 'cuda' in result.stdout.lower()
+        except:
+            return False
 
     def estimate_from_images(self, images: List[torch.Tensor], 
                            colmap_feature_type: str = "sift",
                            colmap_matcher_type: str = "sequential", 
                            colmap_quality: str = "medium",
-                           enable_dense_reconstruction: bool = False) -> Dict:
-        """从图片序列估计相机参数"""
+                           enable_dense_reconstruction: bool = False,
+                           force_gpu: bool = True) -> Dict:
+        """使用原生COLMAP从图片序列估计相机参数"""
         
         if len(images) < 3:
             return {
@@ -52,15 +103,33 @@ class ColmapCameraEstimator:
                 "point_cloud": {}
             }
 
+        print("使用原生COLMAP进行相机参数估计...")
+        print(f"强制GPU模式: {'是' if force_gpu else '否'}")
+        
+        return self._estimate_with_native_colmap(
+            images, colmap_feature_type, colmap_matcher_type, 
+            colmap_quality, enable_dense_reconstruction, force_gpu
+        )
+
+    def _estimate_with_native_colmap(self, images: List[torch.Tensor], 
+                                   colmap_feature_type: str,
+                                   colmap_matcher_type: str, 
+                                   colmap_quality: str,
+                                   enable_dense_reconstruction: bool,
+                                   force_gpu: bool) -> Dict:
+        """使用原生COLMAP进行估计"""
+        
+        import subprocess
+        
         # 创建临时工作目录
-        temp_dir = tempfile.mkdtemp(prefix="colmap_images_")
+        temp_dir = tempfile.mkdtemp(prefix="colmap_native_")
         images_dir = os.path.join(temp_dir, "images")
         database_path = os.path.join(temp_dir, "database.db")
-        output_path = os.path.join(temp_dir, "reconstruction")
+        sparse_dir = os.path.join(temp_dir, "sparse")
         
         try:
             os.makedirs(images_dir, exist_ok=True)
-            os.makedirs(output_path, exist_ok=True)
+            os.makedirs(sparse_dir, exist_ok=True)
 
             # 1. 保存图片到临时目录
             print(f"保存 {len(images)} 张图片到临时目录...")
@@ -69,22 +138,25 @@ class ColmapCameraEstimator:
             # 2. 设置质量参数
             quality_settings = self._get_quality_settings(colmap_quality)
             
-            # 3. 特征提取
-            print("开始特征提取...")
-            self._extract_features(database_path, images_dir, quality_settings)
+            # 3. 特征提取 (原生COLMAP命令)
+            print("开始原生COLMAP特征提取...")
+            self._run_native_feature_extraction(database_path, images_dir, quality_settings, force_gpu)
             
-            # 4. 特征匹配
-            print(f"开始特征匹配 ({colmap_matcher_type})...")
-            self._match_features(database_path, colmap_matcher_type)
+            # 4. 特征匹配 (原生COLMAP命令)
+            print(f"开始原生COLMAP特征匹配 ({colmap_matcher_type})...")
+            self._run_native_feature_matching(database_path, colmap_matcher_type, force_gpu)
             
-            # 5. 增量重建
-            print("开始增量重建...")
-            reconstructions = self._incremental_mapping(database_path, images_dir, output_path)
+            # 5. 增量重建 (原生COLMAP命令)
+            print("开始原生COLMAP增量重建...")
+            self._run_native_mapping(database_path, images_dir, sparse_dir, force_gpu)
             
-            if not reconstructions:
+            # 6. 读取重建结果
+            reconstruction = self._read_native_reconstruction(sparse_dir)
+            
+            if reconstruction is None:
                 return {
                     "success": False,
-                    "error": "COLMAP 重建失败：没有生成重建结果",
+                    "error": "原生COLMAP 重建失败：没有生成重建结果",
                     "intrinsics": None,
                     "poses": [],
                     "statistics": {},
@@ -92,22 +164,21 @@ class ColmapCameraEstimator:
                     "point_cloud": {}
                 }
             
-            # 6. 解析结果
-            reconstruction = self._get_best_reconstruction(reconstructions)
-            result = self._parse_reconstruction(reconstruction, len(images))
+            # 7. 解析结果
+            result = self._parse_native_reconstruction(reconstruction, len(images))
             
-            print(f"重建成功：{len(reconstruction.cameras)} 个相机，{len(reconstruction.images)} 张图像，{len(reconstruction.points3D)} 个3D点")
+            print(f"原生COLMAP重建成功：注册了 {len(result['poses'])} 张图像")
             
             return result
             
         except Exception as e:
-            print(f"COLMAP 估计过程出错: {e}")
+            print(f"原生COLMAP 估计过程出错: {e}")
             import traceback
             traceback.print_exc()
             
             return {
                 "success": False,
-                "error": f"COLMAP 重建失败: {str(e)}",
+                "error": f"原生COLMAP 重建失败: {str(e)}",
                 "intrinsics": None,
                 "poses": [],
                 "statistics": {},
@@ -165,98 +236,590 @@ class ColmapCameraEstimator:
         }
         return quality_settings.get(quality, quality_settings["medium"])
 
-    def _extract_features(self, database_path: str, images_dir: str, quality_settings: Dict):
-        """提取特征"""
-        sift_options = self.pycolmap.SiftExtractionOptions()
-        sift_options.max_image_size = quality_settings["max_image_size"]
-        sift_options.max_num_features = quality_settings["max_num_features"]
+    def _setup_gpu_environment(self) -> Dict[str, str]:
+        """设置GPU环境变量"""
+        import os
         
-        self.pycolmap.extract_features(
-            database_path=database_path,
-            image_path=images_dir,
-            sift_options=sift_options
-        )
+        env = os.environ.copy()
+        
+        # 强制使用GPU
+        env['CUDA_VISIBLE_DEVICES'] = '0'  # 使用第一个GPU
+        
+        # 设置OpenGL/EGL相关变量以支持无头GPU操作
+        env['__GL_SYNC_TO_VBLANK'] = '0'
+        env['__GL_ALLOW_UNOFFICIAL_PROTOCOL'] = '1'
+        
+        # 尝试使用EGL而不是GLX
+        env['__EGL_VENDOR_LIBRARY_DIRS'] = '/usr/share/glvnd/egl_vendor.d'
+        
+        # 禁用Qt的XCB插件，使用offscreen
+        env['QT_QPA_PLATFORM'] = 'offscreen'
+        env['QT_QPA_FONTDIR'] = '/usr/share/fonts'
+        
+        # NVIDIA相关设置
+        env['NVIDIA_VISIBLE_DEVICES'] = 'all'
+        env['NVIDIA_DRIVER_CAPABILITIES'] = 'compute,utility,graphics'
+        
+        return env
 
-    def _match_features(self, database_path: str, matcher_type: str):
-        """匹配特征"""
+    def _run_native_feature_extraction(self, database_path: str, images_dir: str, quality_settings: Dict, force_gpu: bool = True):
+        """运行原生COLMAP特征提取"""
+        import subprocess
+        import os
+        
+        if force_gpu and self.gpu_available:
+            print("🚀 使用强制GPU模式运行COLMAP特征提取...")
+            
+            # 设置GPU环境
+            env = self._setup_gpu_environment()
+            
+            # GPU模式命令 - 使用更简洁的参数
+            gpu_cmd = [
+                'colmap', 'feature_extractor',
+                '--database_path', database_path,
+                '--image_path', images_dir,
+                '--ImageReader.single_camera', '1',
+                '--SiftExtraction.use_gpu', '1',
+                '--SiftExtraction.gpu_index', '0',  # 明确指定GPU 0
+                '--SiftExtraction.max_image_size', str(quality_settings["max_image_size"]),
+                '--SiftExtraction.max_num_features', str(quality_settings["max_num_features"])
+            ]
+            
+            # 首先尝试直接GPU模式
+            print(f"执行命令: {' '.join(gpu_cmd)}")
+            result = subprocess.run(gpu_cmd, capture_output=True, text=True, env=env)
+            
+            if result.returncode == 0:
+                print("✅ GPU模式特征提取成功")
+                return
+            
+            print(f"直接GPU模式失败: {result.stderr}")
+            
+            # 尝试使用nvidia-smi检查GPU状态
+            try:
+                gpu_check = subprocess.run(['nvidia-smi'], capture_output=True, text=True)
+                if gpu_check.returncode == 0:
+                    print("GPU检测正常，尝试使用xvfb-run包装...")
+                    
+                    # 使用xvfb-run + GPU
+                    xvfb_gpu_cmd = [
+                        'xvfb-run', '-a', '-s', '-screen 0 1024x768x24 -ac +extension GLX +render -noreset'
+                    ] + gpu_cmd
+                    
+                    result = subprocess.run(xvfb_gpu_cmd, capture_output=True, text=True, env=env)
+                    
+                    if result.returncode == 0:
+                        print("✅ xvfb-run + GPU模式特征提取成功")
+                        return
+                    
+                    print(f"xvfb-run + GPU模式也失败: {result.stderr}")
+            except:
+                print("无法检查GPU状态")
+        
+        # 如果GPU模式失败，抛出异常（因为用户要求必须使用GPU）
+        if force_gpu:
+            raise RuntimeError("强制GPU模式失败，无法继续。请检查GPU驱动和CUDA安装。")
+        
+        # 备用CPU模式（仅在不强制GPU时使用）
+        print("回退到CPU模式...")
+        env = os.environ.copy()
+        env['QT_QPA_PLATFORM'] = 'offscreen'
+        env['CUDA_VISIBLE_DEVICES'] = ''
+        
+        cpu_cmd = [
+            'colmap', 'feature_extractor',
+            '--database_path', database_path,
+            '--image_path', images_dir,
+            '--ImageReader.single_camera', '1',
+            '--SiftExtraction.use_gpu', '0',
+            '--SiftExtraction.max_image_size', str(quality_settings["max_image_size"]),
+            '--SiftExtraction.max_num_features', str(quality_settings["max_num_features"])
+        ]
+        
+        result = subprocess.run(cpu_cmd, capture_output=True, text=True, env=env)
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"COLMAP特征提取失败: {result.stderr}")
+
+    def _run_native_feature_matching(self, database_path: str, matcher_type: str, force_gpu: bool = True):
+        """运行原生COLMAP特征匹配"""
+        import subprocess
+        import os
+        
+        # 构建基础命令
         if matcher_type == "exhaustive":
-            matching_options = self.pycolmap.ExhaustiveMatchingOptions()
-            self.pycolmap.match_exhaustive(
-                database_path=database_path,
-                matching_options=matching_options
-            )
+            base_cmd = ['colmap', 'exhaustive_matcher', '--database_path', database_path]
         elif matcher_type == "sequential":
-            matching_options = self.pycolmap.SequentialMatchingOptions()
-            matching_options.overlap = 10
-            self.pycolmap.match_sequential(
-                database_path=database_path,
-                matching_options=matching_options
-            )
+            base_cmd = ['colmap', 'sequential_matcher', '--database_path', database_path, '--SequentialMatching.overlap', '10']
         elif matcher_type == "spatial":
-            matching_options = self.pycolmap.SpatialMatchingOptions()
-            self.pycolmap.match_spatial(
-                database_path=database_path,
-                matching_options=matching_options
-            )
+            base_cmd = ['colmap', 'spatial_matcher', '--database_path', database_path]
         else:
             raise ValueError(f"不支持的匹配器类型: {matcher_type}")
-
-    def _incremental_mapping(self, database_path: str, images_dir: str, output_path: str):
-        """增量重建"""
-        # COLMAP >= 0.3.0 使用 IncrementalPipelineOptions 作为配置类型
-        # 早期版本可能仍支持 IncrementalMapperOptions，但为保持兼容性
-        # 这里优先尝试 IncrementalPipelineOptions，并在回退情况下使用默认配置。
-
-        try:
-            pipeline_options = self.pycolmap.IncrementalPipelineOptions()
-
-            # 通过内部的 mapper_options 设置常用参数
-            if hasattr(pipeline_options, "mapper_options"):
-                mapper_opts = pipeline_options.mapper_options
-                mapper_opts.ba_refine_focal_length = True
-                mapper_opts.ba_refine_principal_point = True
-                mapper_opts.init_min_num_inliers = 100
-                mapper_opts.init_max_reg_trials = 2
-        except AttributeError:
-            # 如果安装的 pycolmap 版本没有 IncrementalPipelineOptions，则退回默认
-            pipeline_options = None
-
-        if pipeline_options is not None:
-            reconstructions = self.pycolmap.incremental_mapping(
-                database_path=database_path,
-                image_path=images_dir,
-                output_path=output_path,
-                options=pipeline_options
-            )
-        else:
-            # 回退：不显式传入 options，使用库默认值。
-            reconstructions = self.pycolmap.incremental_mapping(
-                database_path=database_path,
-                image_path=images_dir,
-                output_path=output_path
-            )
         
-        return reconstructions
+        if force_gpu and self.gpu_available:
+            print("🚀 使用强制GPU模式运行COLMAP特征匹配...")
+            
+            # 设置GPU环境
+            env = self._setup_gpu_environment()
+            
+            # GPU模式
+            gpu_cmd = base_cmd + [
+                '--SiftMatching.use_gpu', '1',
+                '--SiftMatching.gpu_index', '0'
+            ]
+            
+            # 直接GPU模式
+            result = subprocess.run(gpu_cmd, capture_output=True, text=True, env=env)
+            
+            if result.returncode == 0:
+                print("✅ GPU模式特征匹配成功")
+                return
+            
+            print(f"直接GPU模式失败: {result.stderr}")
+            
+            # 尝试xvfb-run + GPU
+            try:
+                xvfb_gpu_cmd = [
+                    'xvfb-run', '-a', '-s', '-screen 0 1024x768x24 -ac +extension GLX +render -noreset'
+                ] + gpu_cmd
+                
+                result = subprocess.run(xvfb_gpu_cmd, capture_output=True, text=True, env=env)
+                
+                if result.returncode == 0:
+                    print("✅ xvfb-run + GPU模式特征匹配成功")
+                    return
+                
+                print(f"xvfb-run + GPU模式也失败: {result.stderr}")
+            except:
+                pass
+        
+        # 如果GPU模式失败，抛出异常（因为用户要求必须使用GPU）
+        if force_gpu:
+            raise RuntimeError("强制GPU模式失败，无法继续。请检查GPU驱动和CUDA安装。")
+        
+        # 备用CPU模式
+        print("回退到CPU模式...")
+        env = os.environ.copy()
+        env['QT_QPA_PLATFORM'] = 'offscreen'
+        env['CUDA_VISIBLE_DEVICES'] = ''
+        
+        cpu_cmd = base_cmd + ['--SiftMatching.use_gpu', '0']
+        result = subprocess.run(cpu_cmd, capture_output=True, text=True, env=env)
+        
+        if result.returncode != 0:
+            raise RuntimeError(f"COLMAP特征匹配失败: {result.stderr}")
 
-    def _get_best_reconstruction(self, reconstructions):
-        """获取最佳重建结果"""
-        if isinstance(reconstructions, dict):
-            if len(reconstructions) == 0:
-                raise RuntimeError("重建结果为空")
-            # 选择图像数量最多的重建
-            best_recon = max(reconstructions.values(), key=lambda r: len(r.images))
-            return best_recon
-        elif isinstance(reconstructions, list):
-            if len(reconstructions) == 0:
-                raise RuntimeError("重建结果为空")
-            # 选择图像数量最多的重建
-            best_recon = max(reconstructions, key=lambda r: len(r.images))
-            return best_recon
-        else:
-            return reconstructions
+    def _run_native_mapping(self, database_path: str, images_dir: str, sparse_dir: str, force_gpu: bool = True):
+        """运行原生COLMAP增量重建"""
+        import subprocess
+        import os
+        
+        if force_gpu and self.gpu_available:
+            print("🚀 使用强制GPU模式运行COLMAP重建...")
+            
+            # 设置GPU环境
+            env = self._setup_gpu_environment()
+            
+            # 使用更宽松的重建参数
+            gpu_cmd = [
+                'colmap', 'mapper',
+                '--database_path', database_path,
+                '--image_path', images_dir,
+                '--output_path', sparse_dir,
+                '--Mapper.init_min_num_inliers', '5',  # 非常低的阈值
+                '--Mapper.min_num_matches', '5',       # 非常低的匹配要求
+                '--Mapper.max_num_models', '100',      # 允许更多模型
+                '--Mapper.init_min_tri_angle', '1.0',  # 降低三角化角度要求
+                '--Mapper.multiple_models', '1',       # 允许多模型
+                '--Mapper.extract_colors', '0'         # 关闭颜色提取加速
+            ]
+            
+            print(f"执行GPU重建命令: {' '.join(gpu_cmd)}")
+            
+            # 直接GPU模式
+            result = subprocess.run(gpu_cmd, capture_output=True, text=True, env=env)
+            
+            print(f"COLMAP mapper 返回码: {result.returncode}")
+            if result.stdout:
+                print(f"STDOUT: {result.stdout}")
+            if result.stderr:
+                print(f"STDERR: {result.stderr}")
+            
+            if result.returncode == 0:
+                print("✅ GPU模式重建成功")
+                self._check_reconstruction_output(sparse_dir)
+                return
+            
+            print(f"GPU模式失败: {result.stderr}")
+            
+            # 如果是参数不识别的错误，尝试更基础的参数
+            if "unrecognised option" in result.stderr:
+                print("检测到参数不兼容，尝试基础GPU参数...")
+                basic_gpu_cmd = [
+                    'colmap', 'mapper',
+                    '--database_path', database_path,
+                    '--image_path', images_dir,
+                    '--output_path', sparse_dir
+                ]
+                
+                print(f"执行基础GPU重建命令: {' '.join(basic_gpu_cmd)}")
+                result = subprocess.run(basic_gpu_cmd, capture_output=True, text=True, env=env)
+                
+                print(f"基础GPU mapper 返回码: {result.returncode}")
+                if result.stdout:
+                    print(f"STDOUT: {result.stdout}")
+                if result.stderr:
+                    print(f"STDERR: {result.stderr}")
+                
+                if result.returncode == 0:
+                    print("✅ GPU模式基础参数重建成功")
+                    self._check_reconstruction_output(sparse_dir)
+                    return
+            
+            # 尝试xvfb-run + GPU
+            try:
+                print("尝试xvfb-run + GPU模式...")
+                xvfb_gpu_cmd = [
+                    'xvfb-run', '-a', '-s', '-screen 0 1024x768x24 -ac +extension GLX +render -noreset'
+                ] + gpu_cmd
+                
+                result = subprocess.run(xvfb_gpu_cmd, capture_output=True, text=True, env=env)
+                
+                print(f"xvfb GPU mapper 返回码: {result.returncode}")
+                if result.stdout:
+                    print(f"STDOUT: {result.stdout}")
+                if result.stderr:
+                    print(f"STDERR: {result.stderr}")
+                
+                if result.returncode == 0:
+                    print("✅ xvfb-run + GPU模式重建成功")
+                    self._check_reconstruction_output(sparse_dir)
+                    return
+            except Exception as e:
+                print(f"xvfb-run执行失败: {e}")
+        
+        # 如果GPU模式失败，抛出异常（因为用户要求必须使用GPU）
+        if force_gpu:
+            print("❌ 所有GPU模式尝试都失败了")
+            self._check_reconstruction_output(sparse_dir)
+            raise RuntimeError("强制GPU模式失败，无法继续。请检查图像质量、特征匹配结果或考虑使用CPU模式。")
+        
+        # 备用CPU模式
+        print("回退到CPU模式...")
+        env = os.environ.copy()
+        env['QT_QPA_PLATFORM'] = 'offscreen'
+        env['CUDA_VISIBLE_DEVICES'] = ''
+        
+        # CPU模式使用更宽松的参数
+        cpu_cmd = [
+            'colmap', 'mapper',
+            '--database_path', database_path,
+            '--image_path', images_dir,
+            '--output_path', sparse_dir,
+            '--Mapper.init_min_num_inliers', '3',  # 极低阈值
+            '--Mapper.min_num_matches', '3',       # 极低匹配要求
+            '--Mapper.max_num_models', '100',
+            '--Mapper.init_min_tri_angle', '1.0',
+            '--Mapper.multiple_models', '1',
+            '--Mapper.extract_colors', '0'
+        ]
+        
+        print(f"执行CPU重建命令: {' '.join(cpu_cmd)}")
+        result = subprocess.run(cpu_cmd, capture_output=True, text=True, env=env)
+        
+        print(f"CPU mapper 返回码: {result.returncode}")
+        if result.stdout:
+            print(f"STDOUT: {result.stdout}")
+        if result.stderr:
+            print(f"STDERR: {result.stderr}")
+        
+        if result.returncode != 0:
+            print("❌ CPU模式重建也失败了")
+            self._check_reconstruction_output(sparse_dir)
+            raise RuntimeError(f"COLMAP增量重建失败: {result.stderr}")
+        
+        print("✅ CPU模式重建成功")
+        self._check_reconstruction_output(sparse_dir)
 
-    def _parse_reconstruction(self, reconstruction, num_input_images: int) -> Dict:
-        """解析重建结果"""
+    def _check_reconstruction_output(self, sparse_dir: str):
+        """检查重建输出结果"""
+        print(f"\n🔍 检查重建输出目录: {sparse_dir}")
+        
+        if not os.path.exists(sparse_dir):
+            print("❌ 重建输出目录不存在")
+            return
+        
+        try:
+            items = os.listdir(sparse_dir)
+            print(f"输出目录内容: {items}")
+            
+            if not items:
+                print("⚠️  重建输出目录为空")
+                return
+            
+            for item in items:
+                item_path = os.path.join(sparse_dir, item)
+                if os.path.isdir(item_path):
+                    print(f"\n📁 检查子目录: {item}")
+                    sub_items = os.listdir(item_path)
+                    print(f"  内容: {sub_items}")
+                    
+                    # 检查COLMAP文件
+                    colmap_files = ['cameras.txt', 'images.txt', 'points3D.txt']
+                    for colmap_file in colmap_files:
+                        file_path = os.path.join(item_path, colmap_file)
+                        if os.path.exists(file_path):
+                            size = os.path.getsize(file_path)
+                            print(f"    {colmap_file}: {size} bytes")
+                        else:
+                            print(f"    {colmap_file}: 不存在")
+                            
+        except Exception as e:
+            print(f"❌ 检查输出目录失败: {e}")
+
+    def _read_native_reconstruction(self, sparse_dir: str):
+        """读取原生COLMAP重建结果"""
+        # 查找重建目录
+        recon_dirs = []
+        
+        print(f"检查稀疏重建目录: {sparse_dir}")
+        
+        if not os.path.exists(sparse_dir):
+            print(f"错误: 稀疏目录不存在: {sparse_dir}")
+            return None
+        
+        # 列出所有内容进行诊断
+        try:
+            all_items = os.listdir(sparse_dir)
+            print(f"稀疏目录内容: {all_items}")
+        except Exception as e:
+            print(f"无法列出稀疏目录内容: {e}")
+            return None
+        
+        for item in all_items:
+            item_path = os.path.join(sparse_dir, item)
+            print(f"检查项目: {item} -> {item_path}")
+            
+            if os.path.isdir(item_path):
+                print(f"  发现子目录: {item}")
+                
+                # 检查COLMAP重建文件（支持二进制和文本格式）
+                txt_files = ['cameras.txt', 'images.txt', 'points3D.txt']
+                bin_files = ['cameras.bin', 'images.bin', 'points3D.bin']
+                
+                # 检查文本格式文件
+                txt_exist = all(os.path.exists(os.path.join(item_path, f)) for f in txt_files)
+                # 检查二进制格式文件
+                bin_exist = all(os.path.exists(os.path.join(item_path, f)) for f in bin_files)
+                
+                print(f"    文本格式文件: {'存在' if txt_exist else '不存在'}")
+                print(f"    二进制格式文件: {'存在' if bin_exist else '不存在'}")
+                
+                if txt_exist:
+                    # 如果文本文件存在，检查其有效性
+                    if self._validate_reconstruction_dir(item_path, 'txt'):
+                        recon_dirs.append(item_path)
+                        print(f"    ✅ 有效的文本格式重建目录: {item}")
+                    else:
+                        print(f"    ⚠️  文本文件存在但内容无效: {item}")
+                        
+                elif bin_exist:
+                    # 如果只有二进制文件，尝试转换为文本格式
+                    print(f"    🔄 发现二进制格式，尝试转换为文本格式...")
+                    if self._convert_bin_to_txt(item_path):
+                        if self._validate_reconstruction_dir(item_path, 'txt'):
+                            recon_dirs.append(item_path)
+                            print(f"    ✅ 成功转换并验证重建目录: {item}")
+                        else:
+                            print(f"    ⚠️  转换成功但内容无效: {item}")
+                    else:
+                        # 转换失败，尝试直接使用PyColmap读取二进制格式
+                        print(f"    🔄 转换失败，尝试直接读取二进制格式...")
+                        if self._validate_reconstruction_dir(item_path, 'bin'):
+                            recon_dirs.append(item_path)
+                            print(f"    ✅ 可以直接读取二进制格式: {item}")
+                        else:
+                            print(f"    ❌ 二进制格式也无法读取: {item}")
+                else:
+                    print(f"    ❌ 既没有文本文件也没有二进制文件: {item}")
+            else:
+                print(f"  跳过文件: {item}")
+        
+        if not recon_dirs:
+            print("❌ 未找到任何有效的重建目录")
+            print("可能的原因:")
+            print("  1. COLMAP重建失败但返回了成功状态")
+            print("  2. 重建文件生成不完整")
+            print("  3. 图像特征匹配不足")
+            print("  4. 相机参数初始化失败")
+            return None
+        
+        # 选择第一个重建目录
+        recon_dir = recon_dirs[0]
+        print(f"✅ 选择重建目录: {recon_dir}")
+        
+        # 使用PyColmap读取COLMAP格式文件
+        try:
+            print("正在使用PyColmap读取重建数据...")
+            reconstruction = self.pycolmap.Reconstruction(recon_dir)
+            
+            # 验证读取的数据
+            num_cameras = len(reconstruction.cameras)
+            num_images = len(reconstruction.images)
+            num_points = len(reconstruction.points3D)
+            
+            print(f"✅ 成功读取重建：{num_cameras}个相机，{num_images}张图像，{num_points}个3D点")
+            
+            if num_cameras == 0:
+                print("⚠️  警告: 没有相机数据")
+                return None
+            
+            if num_images == 0:
+                print("⚠️  警告: 没有注册的图像")
+                return None
+            
+            return reconstruction
+            
+        except Exception as e:
+            print(f"❌ PyColmap读取失败: {e}")
+            print("尝试手动检查文件格式...")
+            
+            # 尝试手动读取和诊断文件
+            self._diagnose_colmap_files(recon_dir)
+            return None
+
+    def _convert_bin_to_txt(self, recon_dir: str) -> bool:
+        """将COLMAP二进制格式转换为文本格式"""
+        import subprocess
+        
+        try:
+            print("    执行COLMAP模型转换...")
+            
+            # 设置环境变量
+            env = os.environ.copy()
+            env['QT_QPA_PLATFORM'] = 'offscreen'
+            
+            # 使用COLMAP的model_converter命令
+            cmd = [
+                'colmap', 'model_converter',
+                '--input_path', recon_dir,
+                '--output_path', recon_dir,
+                '--output_type', 'TXT'
+            ]
+            
+            print(f"    转换命令: {' '.join(cmd)}")
+            result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+            
+            print(f"    转换返回码: {result.returncode}")
+            if result.stdout:
+                print(f"    STDOUT: {result.stdout}")
+            if result.stderr:
+                print(f"    STDERR: {result.stderr}")
+            
+            if result.returncode == 0:
+                print("    ✅ 二进制到文本转换成功")
+                return True
+            else:
+                print(f"    ❌ 转换失败: {result.stderr}")
+                return False
+                
+        except Exception as e:
+            print(f"    ❌ 转换过程出错: {e}")
+            return False
+
+    def _validate_reconstruction_dir(self, recon_dir: str, format_type: str) -> bool:
+        """验证重建目录是否有效"""
+        try:
+            if format_type == 'txt':
+                # 验证文本格式
+                required_files = ['cameras.txt', 'images.txt', 'points3D.txt']
+                for req_file in required_files:
+                    file_path = os.path.join(recon_dir, req_file)
+                    if not os.path.exists(file_path):
+                        return False
+                    if not self._validate_colmap_file(file_path, req_file):
+                        return False
+                return True
+                
+            elif format_type == 'bin':
+                # 验证二进制格式 - 尝试用PyColmap读取
+                try:
+                    test_reconstruction = self.pycolmap.Reconstruction(recon_dir)
+                    return len(test_reconstruction.cameras) > 0 and len(test_reconstruction.images) > 0
+                except:
+                    return False
+                    
+        except Exception as e:
+            print(f"      验证目录失败: {e}")
+            return False
+
+    def _validate_colmap_file(self, file_path: str, file_type: str) -> bool:
+        """验证COLMAP文件是否有效"""
+        try:
+            with open(file_path, 'r') as f:
+                lines = f.readlines()
+            
+            # 过滤掉注释和空行
+            data_lines = [line.strip() for line in lines if line.strip() and not line.strip().startswith('#')]
+            
+            if file_type == 'cameras.txt':
+                # 相机文件应该至少有一行数据
+                if len(data_lines) == 0:
+                    print(f"      {file_type}: 没有相机数据")
+                    return False
+                print(f"      {file_type}: {len(data_lines)} 个相机")
+                
+            elif file_type == 'images.txt':
+                # 图像文件应该有成对的行（图像行 + 特征点行）
+                if len(data_lines) == 0:
+                    print(f"      {file_type}: 没有图像数据")
+                    return False
+                print(f"      {file_type}: {len(data_lines)} 行数据")
+                
+            elif file_type == 'points3D.txt':
+                # 3D点文件可以为空（没有3D点也能进行相机估计）
+                print(f"      {file_type}: {len(data_lines)} 个3D点")
+            
+            return True
+            
+        except Exception as e:
+            print(f"      {file_type}: 读取失败 - {e}")
+            return False
+
+    def _diagnose_colmap_files(self, recon_dir: str):
+        """诊断COLMAP文件内容"""
+        print("\n🔍 详细文件诊断:")
+        
+        files_to_check = ['cameras.txt', 'images.txt', 'points3D.txt']
+        
+        for filename in files_to_check:
+            file_path = os.path.join(recon_dir, filename)
+            print(f"\n📄 检查 {filename}:")
+            
+            try:
+                with open(file_path, 'r') as f:
+                    lines = f.readlines()
+                
+                print(f"  总行数: {len(lines)}")
+                
+                # 显示前几行内容
+                print("  前5行内容:")
+                for i, line in enumerate(lines[:5]):
+                    print(f"    {i+1}: {repr(line.strip())}")
+                
+                # 统计数据行
+                data_lines = [line for line in lines if line.strip() and not line.strip().startswith('#')]
+                print(f"  数据行数: {len(data_lines)}")
+                
+                if len(data_lines) > 0:
+                    print("  首个数据行:")
+                    print(f"    {repr(data_lines[0].strip())}")
+                
+            except Exception as e:
+                print(f"  ❌ 无法读取文件: {e}")
+
+    def _parse_native_reconstruction(self, reconstruction, num_input_images: int) -> Dict:
+        """解析原生COLMAP重建结果"""
         try:
             # 解析相机内参
             intrinsics = self._parse_camera_intrinsics(reconstruction)
@@ -286,7 +849,7 @@ class ColmapCameraEstimator:
             }
             
         except Exception as e:
-            print(f"解析重建结果失败: {e}")
+            print(f"解析原生重建结果失败: {e}")
             return {
                 "success": False,
                 "error": f"解析失败: {str(e)}",
@@ -491,6 +1054,10 @@ class ImageSequenceCameraEstimator:
                     "default": False,
                     "tooltip": "是否启用密集重建（需要更多计算资源和CUDA支持）"
                 }),
+                "force_gpu": ("BOOLEAN", {
+                    "default": True,
+                    "tooltip": "强制使用GPU模式（失败时不回退到CPU）"
+                }),
                 "enable_visualization": ("BOOLEAN", {
                     "default": True,
                     "tooltip": "是否生成轨迹可视化图像"
@@ -519,6 +1086,7 @@ class ImageSequenceCameraEstimator:
                                  colmap_matcher_type: str = "sequential", 
                                  colmap_quality: str = "medium",
                                  enable_dense_reconstruction: bool = False,
+                                 force_gpu: bool = True,
                                  enable_visualization: bool = True,
                                  output_format: str = "detailed_json") -> tuple:
         """从图片序列估计相机参数的主函数"""
@@ -543,6 +1111,7 @@ class ImageSequenceCameraEstimator:
                 raise ValueError(f"不支持的图片输入格式: {type(images)}")
             
             print(f"开始处理 {len(image_list)} 张图片")
+            print(f"GPU模式: {'强制启用' if force_gpu else '自适应'}")
             
             # 使用COLMAP进行估计
             result = self.estimator.estimate_from_images(
@@ -550,7 +1119,8 @@ class ImageSequenceCameraEstimator:
                 colmap_feature_type=colmap_feature_type,
                 colmap_matcher_type=colmap_matcher_type,
                 colmap_quality=colmap_quality,
-                enable_dense_reconstruction=enable_dense_reconstruction
+                enable_dense_reconstruction=enable_dense_reconstruction,
+                force_gpu=force_gpu
             )
             
             if not result["success"]:
