@@ -30,35 +30,43 @@ class ColmapMVSDepthEstimator:
         self.gpu_available = self._check_gpu_support()
         print(f"GPU支持: {'可用' if self.gpu_available else '不可用'}")
         
-        # 设置质量参数
+        # 设置质量参数 - 优化后的配置以提高深度图质量
         self.quality_params = {
             "low": {
-                "SiftExtraction.max_image_size": 1000,
-                "SiftExtraction.max_num_features": 2048,
-                "PatchMatchStereo.window_radius": 3,
-                "PatchMatchStereo.num_iterations": 3,
-                "PatchMatchStereo.geom_consistency": "false"
+                "SiftExtraction.max_image_size": 1500,
+                "SiftExtraction.max_num_features": 4096,
+                "PatchMatchStereo.window_radius": 7,
+                "PatchMatchStereo.num_iterations": 8,
+                "PatchMatchStereo.geom_consistency": "true",
+                "PatchMatchStereo.photometric_consistency": 0.2,
+                "PatchMatchStereo.min_triangulation_angle": 1.0
             },
             "medium": {
-                "SiftExtraction.max_image_size": 2000,
-                "SiftExtraction.max_num_features": 8192,
-                "PatchMatchStereo.window_radius": 5,
-                "PatchMatchStereo.num_iterations": 5,
-                "PatchMatchStereo.geom_consistency": "true"
+                "SiftExtraction.max_image_size": 2500,
+                "SiftExtraction.max_num_features": 12288,
+                "PatchMatchStereo.window_radius": 12,
+                "PatchMatchStereo.num_iterations": 15,
+                "PatchMatchStereo.geom_consistency": "true",
+                "PatchMatchStereo.photometric_consistency": 0.15,
+                "PatchMatchStereo.min_triangulation_angle": 1.0
             },
             "high": {
-                "SiftExtraction.max_image_size": 3000,
-                "SiftExtraction.max_num_features": 16384,
-                "PatchMatchStereo.window_radius": 7,
-                "PatchMatchStereo.num_iterations": 7,
-                "PatchMatchStereo.geom_consistency": "true"
+                "SiftExtraction.max_image_size": 4000,
+                "SiftExtraction.max_num_features": 20480,
+                "PatchMatchStereo.window_radius": 15,
+                "PatchMatchStereo.num_iterations": 20,
+                "PatchMatchStereo.geom_consistency": "true",
+                "PatchMatchStereo.photometric_consistency": 0.1,
+                "PatchMatchStereo.min_triangulation_angle": 0.8
             },
             "extreme": {
                 "SiftExtraction.max_image_size": -1,  # 原始尺寸
-                "SiftExtraction.max_num_features": 32768,
-                "PatchMatchStereo.window_radius": 9,
-                "PatchMatchStereo.num_iterations": 10,
-                "PatchMatchStereo.geom_consistency": "true"
+                "SiftExtraction.max_num_features": 40960,
+                "PatchMatchStereo.window_radius": 18,
+                "PatchMatchStereo.num_iterations": 25,
+                "PatchMatchStereo.geom_consistency": "true",
+                "PatchMatchStereo.photometric_consistency": 0.08,
+                "PatchMatchStereo.min_triangulation_angle": 0.6
             }
         }
 
@@ -489,10 +497,12 @@ class ColmapMVSDepthEstimator:
     def _run_patch_match_stereo(self, dense_dir: str, force_gpu: bool = True):
         """运行Patch Match Stereo深度估计"""
         params = self.quality_params[self.quality].copy()
-
-        # 增加一个临时修复，强制禁用几何一致性检查，这在某些新GPU上可能导致bug
-        print("🔧 临时修复: 为避免新GPU下的潜在Bug，强制禁用几何一致性检查。")
-        params["PatchMatchStereo.geom_consistency"] = "false"
+        
+        print(f"🎯 使用质量设置: {self.quality}")
+        print(f"   - 窗口半径: {params.get('PatchMatchStereo.window_radius', 'N/A')}")
+        print(f"   - 迭代次数: {params.get('PatchMatchStereo.num_iterations', 'N/A')}")
+        print(f"   - 几何一致性: {params.get('PatchMatchStereo.geom_consistency', 'N/A')}")
+        print(f"   - 光度一致性: {params.get('PatchMatchStereo.photometric_consistency', 'N/A')}")
         
         # 如果强制GPU但没有CUDA支持，根据设置决定行为
         if force_gpu and not self.colmap_has_cuda:
@@ -1337,16 +1347,21 @@ class VVLColmapMVSDepthNode:
                     depth_map, None, 0, 1, cv2.NORM_MINMAX, dtype=cv2.CV_32F
                 )
                 
-                # 转换为RGB格式以便在ComfyUI中显示
-                depth_rgb = np.stack([depth_normalized] * 3, axis=-1)
-                depth_tensor = torch.from_numpy(depth_rgb).float()
+                # 使用Viridis颜色映射创建彩色深度图
+                depth_colored = cv2.applyColorMap(
+                    (depth_normalized * 255).astype(np.uint8), 
+                    cv2.COLORMAP_VIRIDIS
+                )
+                # OpenCV使用BGR，转换为RGB
+                depth_colored_rgb = cv2.cvtColor(depth_colored, cv2.COLOR_BGR2RGB)
+                depth_tensor = torch.from_numpy(depth_colored_rgb / 255.0).float()
                 depth_tensors.append(depth_tensor)
                 
                 # 保存到磁盘（如果需要）
                 if save_to_disk and output_dir_actual:
                     depth_path = os.path.join(output_dir_actual, f"depth_{i:06d}.png")
-                    depth_img = (depth_normalized * 255).astype(np.uint8)
-                    cv2.imwrite(depth_path, depth_img)
+                    # 保存彩色深度图
+                    cv2.imwrite(depth_path, depth_colored)  # BGR格式，适合OpenCV
                     file_paths.append(depth_path)
                     
                     # 同时保存原始深度数据

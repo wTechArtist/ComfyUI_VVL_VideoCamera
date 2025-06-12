@@ -1,6 +1,28 @@
-opencv-python>=4.8.0
-numpy>=1.21.0
-matplotlib>=3.5.0
-torch>=1.11.0
-pillow>=8.3.0
-pycolmap>=0.3.0
+# VVL VideoCamera 节点依赖 - 推荐使用 uv 安装
+# 
+# 核心依赖 - 必需安装
+torch>=1.11.0              # PyTorch 深度学习框架 (当前: 2.6.0+cu118)
+numpy>=1.21.0              # 数值计算 (当前: 1.26.4)
+opencv-python>=4.8.0       # 计算机视觉处理 (当前: 4.11.0)
+pillow>=8.3.0              # 图像处理 (当前: 10.4.0)
+matplotlib>=3.5.0          # 可视化和图表生成 (当前: 3.9.2)
+
+# COLMAP集成 - 强烈推荐
+pycolmap>=0.3.0            # COLMAP Python绑定 (当前: 3.11.1)
+
+# 高级点云融合 - 可选但推荐  
+# open3d>=0.15.0           # TSDF点云融合支持
+                           # 推荐安装: uv pip install open3d
+
+# 系统依赖 (需要单独安装):
+# - COLMAP: sudo apt install colmap  (Ubuntu/Debian)
+#          或参考: https://colmap.github.io/install.html
+# - NVIDIA驱动和CUDA (用于GPU加速，可选)
+
+# 快速安装 (推荐使用 uv):
+# 1. 安装核心依赖: uv pip install -r requirements.txt
+# 2. 安装Open3D: uv pip install open3d
+# 
+# 如果没有安装uv，请先安装: curl -LsSf https://astral.sh/uv/install.sh | sh
+# 
+# 完整安装指南请查看 REQUIREMENTS.md
